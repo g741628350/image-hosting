@@ -1,0 +1,1801 @@
+import warnings
+warnings.filterwarnings("ignore")
+import errno
+from functools import wraps
+from threading import Thread
+from collections import deque
+import os
+import re
+import pandas as pd
+import configparser
+from PyQt5 import QtWidgets, QtGui, QtCore, Qt
+from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtWidgets import QDialog, QMessageBox
+import time
+import threading
+import concurrent.futures
+
+# 配置文件路径
+CONFIG_FILE = 'config.ini'
+
+class TimeoutError(Exception):
+    pass
+
+def timeout(seconds=10):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = []
+            def target():
+                try:
+                    result.append(func(*args, **kwargs))
+                except Exception as e:
+                    result.append(e)
+            
+            thread = Thread(target=target)
+            thread.start()
+            thread.join(seconds)
+            
+            if thread.is_alive():
+                raise TimeoutError(f"Timeout after {seconds} seconds")
+            elif isinstance(result[0], Exception):
+                raise result[0]
+            return result[0]
+        return wrapper
+    return decorator
+
+class FilePathSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, initial_path=""):
+        super().__init__()
+        self.setWindowTitle("选择文件路径")
+        self.setGeometry(100, 100, 400, 150)
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+
+        # 添加拖动相关的属性
+        self.is_dragging = False
+        self.drag_position = None
+
+        # 创建标题栏
+        title_bar = QtWidgets.QWidget()
+        title_bar.setFixedHeight(30)
+        title_bar.setStyleSheet("background-color: #2b2b2b;")
+
+        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(10, 0, 0, 0)
+
+        # 添加标题文本
+        title_label = QtWidgets.QLabel("选择文件路径")
+        title_label.setStyleSheet("color: white; font-size: 12px;")
+        title_layout.addWidget(title_label)
+
+        # 创建输入框和按钮
+        self.file_path_input = QtWidgets.QLineEdit(self)
+        self.file_path_input.setPlaceholderText("请输入文件路径")
+        self.file_path_input.setText(initial_path)
+
+        self.browse_button = QtWidgets.QPushButton("浏览", self)
+        self.browse_button.clicked.connect(self.browse_file)
+
+        self.confirm_button = QtWidgets.QPushButton("确认", self)
+        self.confirm_button.clicked.connect(self.confirm_path)
+
+        # 布局
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)  # 设置布局边距为0
+        layout.setSpacing(0)  # 设置布局间距为0
+
+        # 创建内容容器
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+
+        content_layout.addWidget(self.file_path_input)
+        content_layout.addWidget(self.browse_button)
+        content_layout.addWidget(self.confirm_button)
+
+        # 添加标题栏和内容到主布局
+        layout.addWidget(title_bar)
+        layout.addWidget(content)
+
+        # 应用样式表
+        self.setStyleSheet(
+            """ 
+            QWidget {
+                background-color: #333333;
+                color: white;
+                font-family: Arial, sans-serif;
+            }
+            QLineEdit {
+                background-color: #404040;
+                border: 1px solid #555555;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #1884D7;
+            }
+        """
+        )
+
+    def browse_file(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if folder:
+            self.file_path_input.setText(folder)
+
+    def confirm_path(self):
+        folder_path = self.file_path_input.text().strip()
+        if os.path.exists(folder_path):
+            self.accept()  # 关闭对话框并返回成功
+        else:
+            QtWidgets.QMessageBox.warning(self, "错误", "路径无效，请重新输入。")
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            if event.pos().y() <= 30:  # 只在标题栏区域响应拖动
+                self.is_dragging = True
+                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self.is_dragging:
+            self.move(event.globalPos() - self.drag_position)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.is_dragging = False
+
+
+class LineConfigDialog(QtWidgets.QDialog):
+    def __init__(self, lines_dict):
+        super().__init__()
+        self.setWindowTitle("线别配置")
+        self.setGeometry(100, 100, 500, 400)
+        self.lines_dict = lines_dict.copy()
+        
+        # 创建布局
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        # 创建表格
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(['线别', '路径'])
+        
+        # 设置表格表头样式
+        self.table.horizontalHeader().setStyleSheet("""
+            QHeaderView {
+                background-color: #333333;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: white;
+                padding: 5px;
+                border: 1px solid #555555;
+            }
+        """)
+        
+        self.table.verticalHeader().setStyleSheet("""
+            QHeaderView, QHeaderView::section {
+                background-color: #333333;
+                color: white;
+                border: 1px solid #555555;
+            }
+        """)
+        
+        # 设置表格样式
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #404040;
+                border: 1px solid #555555;
+                gridline-color: #555555;
+            }
+            QTableWidget::item {
+                color: white;
+            }
+        """)
+        
+        self.refresh_table()
+        
+        # 添加/删除按钮
+        btn_layout = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("添加线别")
+        del_btn = QtWidgets.QPushButton("删除选中")
+        add_btn.clicked.connect(self.add_line)
+        del_btn.clicked.connect(self.delete_line)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(del_btn)
+        
+        # 确认/取消按钮
+        dialog_btns = QtWidgets.QHBoxLayout()
+        confirm_btn = QtWidgets.QPushButton("确认")
+        cancel_btn = QtWidgets.QPushButton("取消")
+        confirm_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        
+        dialog_btns.addWidget(confirm_btn)
+        dialog_btns.addWidget(cancel_btn)
+        
+        layout.addWidget(self.table)
+        layout.addLayout(btn_layout)
+        layout.addLayout(dialog_btns)
+        
+        # 应用样式
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #333333;
+                color: white;
+            }
+            QTableWidget {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #555555;
+            }
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #1884D7;
+            }
+        """)
+
+    def refresh_table(self):
+        self.table.setRowCount(len(self.lines_dict))
+        self.table.verticalHeader().setVisible(False)  # 隐藏行头
+        for i, (line, path) in enumerate(self.lines_dict.items()):
+            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(line))
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(path))
+
+    def add_line(self):
+        dialog = FilePathSelectionDialog()
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            path = dialog.file_path_input.text().strip()
+            line_name, ok = QtWidgets.QInputDialog.getText(self, "输入线别", "请输入线别名称:")
+            if ok and line_name:
+                self.lines_dict[line_name] = path
+                self.refresh_table()
+
+    def delete_line(self):
+        current_row = self.table.currentRow()
+        if current_row >= 0:
+            line = self.table.item(current_row, 0).text()
+            del self.lines_dict[line]
+            self.refresh_table()
+
+
+class QueryWorker(QObject):
+    finished = pyqtSignal()
+    progress = pyqtSignal(int)
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self._is_cancelled = False
+        self._lock = threading.Lock()
+        self.results = []
+
+    def cancel(self):
+        with self._lock:
+            self._is_cancelled = True
+            
+    def _check_cancelled(self):
+        """检查是否被取消"""
+        with self._lock:
+            return self._is_cancelled
+            
+    def _scan_directory(self, path, start_time, end_time):
+        """优化的目录扫描函数，添加网络路径超时控制"""
+        try:
+            files = []
+            print(f"\n开始扫描目录: {path}")
+            print(f"查询时间范围: {start_time} 到 {end_time}")
+            
+            scanned_count = 0
+            matched_count = 0
+            
+            # 检测是否为网络路径
+            network_path = is_network_path(path)
+            if network_path:
+                print("检测到网络路径，将应用特殊处理")
+            
+            # 使用线程池加速扫描
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = []
+                
+                # 递归扫描所有子目录，添加超时控制
+                if network_path:
+                    # 对网络路径使用单独的线程进行os.walk，以便能够中断
+                    walk_futures = []
+                    for root, dirs, filenames in self._walk_with_timeout(path, timeout=30):
+                        if self._check_cancelled():
+                            print("扫描被取消")
+                            return []
+                            
+                        for filename in filenames:
+                            if filename.endswith('.otr'):
+                                scanned_count += 1
+                                if scanned_count % 100 == 0:
+                                    print(f"已扫描文件数: {scanned_count}")
+                                    
+                                file_path = os.path.join(root, filename)
+                                futures.append(
+                                    executor.submit(self._check_file_with_timeout,
+                                                 file_path,
+                                                 start_time,
+                                                 end_time,
+                                                 5)  # 5秒超时
+                                )
+                else:
+                    # 非网络路径使用普通方式
+                    for root, _, filenames in os.walk(path):
+                        if self._check_cancelled():
+                            print("扫描被取消")
+                            return []
+                            
+                        for filename in filenames:
+                            if filename.endswith('.otr'):
+                                scanned_count += 1
+                                if scanned_count % 100 == 0:
+                                    print(f"已扫描文件数: {scanned_count}")
+                                    
+                                file_path = os.path.join(root, filename)
+                                futures.append(
+                                    executor.submit(self._check_file,
+                                                 file_path,
+                                                 start_time,
+                                                 end_time)
+                                )
+                
+                # 收集结果            
+                for future in concurrent.futures.as_completed(futures):
+                    if self._check_cancelled():
+                        print("扫描被取消")
+                        return []
+                        
+                    result = future.result()
+                    if result:
+                        matched_count += 1
+                        files.append(result)
+                        
+            print(f"\n扫描完成:")
+            print(f"- 总扫描文件数: {scanned_count}")
+            print(f"- 符合时间条件的文件数: {matched_count}")
+            return files
+            
+        except Exception as e:
+            print(f"扫描目录出错: {str(e)}")
+            return []
+            
+    def _check_file(self, file_path, start_time, end_time):
+        """检查单个文件是否符合条件"""
+        try:
+            # 获取文件创建时间
+            create_time = os.path.getctime(file_path)
+            create_time_str = time.strftime('%Y%m%d %H:%M', 
+                                          time.localtime(create_time))
+            
+            # 检查文件是否在时间范围内                    
+            if start_time <= create_time_str <= end_time:
+                print(f"\n文件符合时间条件: {os.path.basename(file_path)}")
+                print(f"- 创建时间: {create_time_str}")
+                print(f"- 查询范围: {start_time} 到 {end_time}")
+                return file_path
+                
+            # 打印不符合条件的原因    
+            print(f"\n文件不符合时间条件: {os.path.basename(file_path)}")
+            print(f"- 创建时间: {create_time_str}")
+            print(f"- 查询范围: {start_time} 到 {end_time}")
+                
+        except (PermissionError, OSError) as e:
+            print(f"跳过文件 {os.path.basename(file_path)}: {str(e)}")
+            
+        return None
+
+    @timeout(2)  # 文件处理超时控制
+    def _process_file(self, file_path):
+        """处理单个文件"""
+        try:
+            # 首先检查文件是否存在
+            if not os.path.exists(file_path):
+                print(f"文件不存在: {file_path}")
+                return None
+                
+            # 获取文件信息
+            file_stats = os.stat(file_path)
+            creation_time = time.strftime('%Y%m%d %H:%M', 
+                                        time.localtime(file_stats.st_ctime))
+            
+            return {
+                'creation_time': creation_time,
+                'size': file_stats.st_size,
+                'modified_time': file_stats.st_mtime
+            }
+            
+        except Exception as e:
+            print(f"处理文件失败 {file_path}: {str(e)}")
+            return None
+            
+    def do_query(self, path, material_code, start_time, end_time, position=None):
+        """执行查询"""
+        try:
+            print(f"\n开始执行查询:")
+            print(f"- 路径: {path}")
+            print(f"- 物料代码: {material_code}")
+            print(f"- 位号: {position}")
+            print(f"- 时间范围: {start_time} 到 {end_time}")
+            
+            # 重置状态
+            self._is_cancelled = False
+            self.results = []
+            
+            # 扫描文件
+            files = self._scan_directory(path, start_time, end_time)
+            if not files:
+                print("未找到符合条件的文件")
+                self.error.emit("未找到符合条件的文件")
+                return
+                
+            total_files = len(files)
+            processed = 0
+            matched_files = 0
+            
+            # 处理文件
+            for file_path in files:
+                if self._check_cancelled():
+                    print("查询被取消")
+                    return
+                    
+                try:
+                    file_info = self._process_file(file_path)
+                    if file_info:
+                        # 提取物料代码和位号
+                        file_name = os.path.basename(file_path)
+                        extracted_info = self.extract_info(file_name)
+                        
+                        if extracted_info:
+                            mat_code, pos = extracted_info
+                            
+                            # 添加筛选条件的日志
+                            print(f"\n检查文件是否符合筛选条件:")
+                            print(f"- 文件: {file_name}")
+                            print(f"- 物料代码匹配: {not material_code or mat_code == material_code}")
+                            print(f"- 位号匹配: {not position or pos == position}")
+                            
+                            # 筛选逻辑
+                            if (not material_code or mat_code == material_code) and \
+                               (not position or pos == position):
+                                matched_files += 1
+                                self.results.append((mat_code, pos))
+                                
+                except Exception as e:
+                    print(f"处理文件出错 {file_path}: {str(e)}")
+                    continue
+                    
+                processed += 1
+                self.progress.emit(int((processed / total_files) * 100))
+                
+            # 统计结果
+            count_dict = {}
+            for mat_code, pos in self.results:
+                key = (mat_code, pos)
+                count_dict[key] = count_dict.get(key, 0) + 1
+                
+            print(f"\n查询完成:")
+            print(f"- 总文件数: {total_files}")
+            print(f"- 处理文件数: {processed}")
+            print(f"- 符合条件文件数: {matched_files}")
+            print(f"- 统计结果: {count_dict}")
+            
+            # 发送结果
+            if not self._is_cancelled:
+                self.result.emit(count_dict)
+                
+            # 发送完成信号
+            self.finished.emit()
+            
+        except Exception as e:
+            error_msg = f"查询过程发生错误: {str(e)}"
+            print(error_msg)
+            self.error.emit(error_msg)
+        finally:
+            # 确保在所有情况下都发出完成信号
+            self.finished.emit()
+
+    @QtCore.pyqtSlot()
+    def cleanup(self):
+        """清理资源"""
+        self.deleteLater()
+
+    def extract_info(self, file_name):
+        """从文件名中提取物料代码和位号
+        文件名格式: 物料代码_位号_序号_时间戳.otr
+        例如: 0800278_U201_1_20250123-120022.otr
+        """
+        try:
+            print(f"\n解析文件名: {file_name}")
+            
+            # 分割文件名,去掉扩展名
+            name_without_ext = os.path.splitext(file_name)[0]
+            
+            # 按下划线分割
+            parts = name_without_ext.split('_')
+            
+            if len(parts) >= 4:  # 确保至少有4个部分
+                material_code = parts[0]  # 第一部分是物料代码
+                position = parts[1]       # 第二部分是位号
+                
+                print(f"解析结果:")
+                print(f"- 物料代码: {material_code}")
+                print(f"- 位号: {position}")
+                
+                return material_code, position
+                
+            print(f"文件名格式无效: {file_name}")
+            print(f"- 分割后部分: {parts}")
+            return None, None
+            
+        except Exception as e:
+            print(f"解析文件名出错 {file_name}: {str(e)}")
+            return None, None
+
+
+class ProgressDialog(QDialog):
+    cancelled = pyqtSignal()
+    
+    def __init__(self, worker, worker_thread):
+        super().__init__()
+        self.worker = worker
+        self.worker_thread = worker_thread
+        self.program_closing = False  # 添加标志
+        
+        # 移除复杂的状态标志
+        self.setWindowTitle("处理中")
+        self.setFixedSize(300, 150)
+        self.setWindowFlags(QtCore.Qt.Dialog | QtCore.Qt.FramelessWindowHint)
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        self.progress_bar = QtWidgets.QProgressBar(self)
+        self.progress_bar.setTextVisible(True)
+        self.status_label = QtWidgets.QLabel("正在处理文件...", self)
+        self.cancel_button = QtWidgets.QPushButton("取消", self)
+        self.cancel_button.clicked.connect(self.cancelled.emit)
+        
+        # 添加详细进度信息标签
+        self.detail_label = QtWidgets.QLabel("准备开始扫描...", self)
+        layout.insertWidget(1, self.detail_label)
+        
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.cancel_button)
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #333333;
+                border: 1px solid #555555;
+                border-radius: 5px;
+            }
+            QLabel {
+                color: white;
+            }
+            QProgressBar {
+                border: 1px solid #555555;
+                border-radius: 3px;
+                text-align: center;
+                color: white;
+                background-color: #404040;
+            }
+            QProgressBar::chunk {
+                background-color: #0078D7;
+                border-radius: 2px;
+            }
+        """)
+        
+        # 连接进度信号
+        self.worker.progress.connect(self.progress_bar.setValue)
+
+    def closeEvent(self, event):
+        """只在用户手动关闭窗口且有任务运行时询问"""
+        if not self.program_closing and hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+            reply = QMessageBox.question(
+                self, '确认关闭', 
+                '有正在进行的查询任务,确定要关闭吗?',
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                # 取消任务并关闭
+                self.worker.cancel()
+                self.worker_thread.quit()
+                self.worker_thread.wait()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            # 程序主动关闭或没有运行中的任务,直接关闭
+            event.accept()
+            
+    def close(self):
+        """程序主动关闭时调用"""
+        self.program_closing = True
+        super().close()
+
+    def confirm_cancel(self):
+        """添加取消确认对话框"""
+        reply = QMessageBox.question(
+            self, '确认取消', 
+            '确定要取消当前操作吗?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.cancelled.emit()
+            
+    def update_detail(self, message):
+        """更新详细进度信息"""
+        self.detail_label.setText(message)
+
+
+class OTRStatisticsApp(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.lines_dict = self.load_config()  # 加载所有线别配置
+        self.line_combo = QtWidgets.QComboBox()  # 提前创建line_combo
+        self.setup_ui()  # 先创建UI
+        
+        # 如果没有配置，显示配置对话框
+        if not self.lines_dict:
+            if not self.show_line_config():
+                self.close()
+                return
+        # 配置完成后更新下拉框
+        self.line_combo.clear()
+        self.line_combo.addItems(self.lines_dict.keys())
+
+        # 修改线程相关的成员变量初始化
+        self._worker = None
+        self._worker_thread = None
+        self._progress_dialog = None
+        self._is_querying = False  # 添加查询状态标志
+
+    def setup_ui(self):
+        # 初始化导出数据
+        self.export_data = None  # 用于存储要导出的数据
+
+        # 初始化拖动和调整大小相关属性
+        self.is_dragging = False
+        self.drag_position = None
+        self.resizing = False
+        self.resize_edge = None
+        self.resize_start_pos = None
+        self.start_geometry = None
+        self.RESIZE_MARGIN = 5  # 调整大小的边缘宽度
+
+        # 设置无边框窗口
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)  # 允许使用透明度
+
+        self.setWindowTitle("VI OTR 报错统计工具")
+        self.setGeometry(100, 100, 800, 600)
+
+        # 创建主布局
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)  # 设置主布局边距为0
+        main_layout.setSpacing(0)  # 设置布局间距为0
+
+        # 创建一个带圆角的容器widget
+        container = QtWidgets.QWidget(self)
+        container.setObjectName("container")
+        container_layout = QtWidgets.QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        # 创建标题栏
+        title_bar = QtWidgets.QWidget()
+        title_bar.setFixedHeight(30)
+        title_bar.setStyleSheet("background-color: #2b2b2b;")
+
+        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(10, 0, 0, 0)
+
+        # 添加标题文本
+        title_label = QtWidgets.QLabel("VI OTR 报错统计工具")
+        title_label.setStyleSheet("color: white; font-size: 12px;")
+
+        # 创建窗口控制按钮
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.setSpacing(0)
+
+        self.minimize_button = QtWidgets.QPushButton()
+        self.maximize_button = QtWidgets.QPushButton()
+        self.close_button = QtWidgets.QPushButton()
+
+        # 设置按钮图标
+        self.minimize_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarMinButton)
+        )
+        self.maximize_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarMaxButton)
+        )
+        self.close_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarCloseButton)
+        )
+
+        # 设置按钮大小
+        for btn in (self.minimize_button, self.maximize_button, self.close_button):
+            btn.setFixedSize(30, 30)
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: transparent;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #404040;
+                }
+                QPushButton:pressed {
+                    background-color: #505050;
+                }
+            """
+            )
+
+        self.close_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: transparent;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #e81123;
+            }
+            QPushButton:pressed {
+                background-color: #f1707a;
+            }
+        """
+        )
+
+        # 添加按钮到布局
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        title_layout.addWidget(self.minimize_button)
+        title_layout.addWidget(self.maximize_button)
+        title_layout.addWidget(self.close_button)
+
+        # 创建内容区域
+        content_widget = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(
+            10, 10, 10, 10
+        )  # 设置内容区域的边距
+
+        # 创建输入框和按钮
+        input_widget = QtWidgets.QWidget()
+        input_layout = QtWidgets.QVBoxLayout(input_widget)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.material_code_input = QtWidgets.QLineEdit(self)
+        self.material_code_input.setPlaceholderText("请输入物料代码")
+        self.position_input = QtWidgets.QLineEdit(self)
+        self.position_input.setPlaceholderText("请输入位号")
+
+        self.start_time_input = QtWidgets.QDateTimeEdit(self)
+        self.start_time_input.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.start_time_input.setDateTime(QtCore.QDateTime.currentDateTime())
+
+        self.end_time_input = QtWidgets.QDateTimeEdit(self)
+        self.end_time_input.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.end_time_input.setDateTime(QtCore.QDateTime.currentDateTime().addSecs(-1))
+
+        self.query_button = QtWidgets.QPushButton("查询", self)
+        self.export_button = QtWidgets.QPushButton("导出为Excel", self)
+
+        # 创建 QTableWidget 以显示查询结果
+        self.result_table = QtWidgets.QTableWidget(self)
+        self.result_table.setColumnCount(3)
+        self.result_table.setHorizontalHeaderLabels(
+            ['物料代码', '位号', '报警次数']
+        )
+
+        # 设置表格样式
+        self.result_table.horizontalHeader().setStyleSheet(
+            """
+            QHeaderView {
+                background-color: #333333;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: white;
+                padding: 5px;
+                border: 1px solid #555555;
+            }
+        """
+        )
+
+        self.result_table.verticalHeader().setStyleSheet(
+            """
+            QHeaderView, QHeaderView::section {
+                background-color: #333333;
+                color: white;
+                border: 1px solid #555555;
+            }
+        """
+        )
+
+        # 确保垂直表头可见
+        self.result_table.verticalHeader().setVisible(True)
+
+        # 设置表格网格线颜色
+        self.result_table.setStyleSheet(
+            """
+            QTableWidget {
+                background-color: #404040;
+                border: 1px solid #555555;
+                gridline-color: #555555;
+            }
+            QTableWidget::item {
+                color: white;
+            }
+        """
+        )
+
+        # 在现有代码的input_layout中添加线别选择
+        line_layout = QtWidgets.QHBoxLayout()
+        self.line_combo.clear()  # 清除可能存在的旧数据
+        self.line_combo.addItems(self.lines_dict.keys())
+        config_btn = QtWidgets.QPushButton("配置线别")
+        config_btn.clicked.connect(self.show_line_config)
+        
+        line_layout.addWidget(QtWidgets.QLabel("选择线别:"))
+        line_layout.addWidget(self.line_combo)
+        line_layout.addWidget(config_btn)
+        
+        # 将line_layout添加到input_layout的最前面
+        input_layout.insertLayout(0, line_layout)
+        
+        # 修改下拉框样式
+        self.line_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #555555;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #404040;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                background: none;
+                border: none;
+                width: 12px;
+                height: 12px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #404040;
+                color: white;
+                selection-background-color: #0078D7;
+                selection-color: white;
+                border: 1px solid #555555;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 5px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #505050;
+            }
+        """)
+
+        # 设置下拉箭头图标
+        self.line_combo.view().window().setWindowFlags(QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint | QtCore.Qt.NoDropShadowWindowHint)
+        self.line_combo.view().window().setAttribute(QtCore.Qt.WA_TranslucentBackground)
+
+        input_layout.addWidget(self.material_code_input)
+        input_layout.addWidget(self.position_input)
+        input_layout.addWidget(QtWidgets.QLabel("开始时间 (YYYY-MM-DD HH:mm):"))
+        input_layout.addWidget(self.start_time_input)
+        input_layout.addWidget(QtWidgets.QLabel("结束时间 (YYYY-MM-DD HH:mm):"))
+        input_layout.addWidget(self.end_time_input)
+        input_layout.addWidget(self.query_button)
+        input_layout.addWidget(self.export_button)
+
+        content_layout.addWidget(input_widget)
+        content_layout.addWidget(self.result_table)
+
+        # 将标题栏和内容区域添加到容器布局
+        container_layout.addWidget(title_bar)
+        container_layout.addWidget(content_widget)
+
+        # 将容器添加到主布局
+        main_layout.addWidget(container)
+
+        # 连接按钮信号
+        self.minimize_button.clicked.connect(self.showMinimized)
+        self.maximize_button.clicked.connect(self.toggle_maximize)
+        self.close_button.clicked.connect(self.close)
+
+        # 添加查询和导出按钮的信号连接
+        self.query_button.clicked.connect(self.query_errors)
+        self.export_button.clicked.connect(self.export_to_excel)
+
+        # 设置整体窗口样式
+        self.setStyleSheet(
+            """
+            QWidget#container {
+                background-color: #333333;
+                border-radius: 5px;
+            }
+            QWidget {
+                color: white;
+                font-family: Arial, sans-serif;
+            }
+            QLineEdit, QDateTimeEdit {
+                background-color: #404040;
+                border: 1px solid #555555;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #1884D7;
+            }
+            QTableWidget {
+                background-color: #404040;
+                border: 1px solid #555555;
+                gridline-color: #555555;
+            }
+            QTableWidget::item {
+                color: white;
+            }
+            QHeaderView {
+                background-color: #333333;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: white;
+                padding: 5px;
+                border: 1px solid #555555;
+            }
+            QHeaderView::section:horizontal {
+                background-color: #333333;
+            }
+            QHeaderView::section:vertical {
+                background-color: #333333;
+            }
+        """
+        )
+
+    def toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+            self.maximize_button.setIcon(
+                self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarNormalButton)
+            )
+        else:
+            self.showMaximized()
+            self.maximize_button.setIcon(
+                self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarMaxButton)
+            )
+
+    def load_config(self):
+        try:
+            config = configparser.ConfigParser()
+            if os.path.exists(CONFIG_FILE):
+                config.read(CONFIG_FILE, encoding='utf-8')
+                # 读取所有线别和路径
+                if 'Lines' in config:
+                    return dict(config['Lines'])
+            return {}
+        except Exception as e:
+            print(f"加载配置文件出错: {str(e)}")
+            return {}  # 出错时返回空字典
+
+    def save_config(self, lines_dict):
+        try:
+            config = configparser.ConfigParser()
+            config['Lines'] = lines_dict
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as configfile:
+                config.write(configfile)
+        except Exception as e:
+            print(f"保存配置文件出错: {str(e)}")
+            QtWidgets.QMessageBox.warning(self, "警告", f"保存配置文件失败: {str(e)}")
+
+    def show_file_path_selection(self):
+        # 获取当前选中线别的路径作为初始路径
+        current_line = self.line_combo.currentText()
+        initial_path = self.lines_dict.get(current_line, "")
+        
+        dialog = FilePathSelectionDialog(initial_path)
+        result = dialog.exec_()
+        if result == QtWidgets.QDialog.Accepted:
+            new_path = dialog.file_path_input.text().strip()
+            # 更新当前线别的路径
+            if current_line:
+                self.lines_dict[current_line] = new_path
+                self.save_config(self.lines_dict)
+            return True
+        return False
+    
+    def show_line_config(self):
+        dialog = LineConfigDialog(self.lines_dict)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            # 更新线别字典
+            self.lines_dict = dialog.lines_dict
+            self.save_config(self.lines_dict)
+            
+            # 立即更新下拉框
+            current_text = self.line_combo.currentText()  # 保存当前选择
+            self.line_combo.clear()
+            self.line_combo.addItems(self.lines_dict.keys())
+            
+            # 如果之前选择的线别还存在，则保持选择
+            index = self.line_combo.findText(current_text)
+            if index >= 0:
+                self.line_combo.setCurrentIndex(index)
+            # 如果有线别，但之前的选择不存在了，则选择第一个
+            elif self.line_combo.count() > 0:
+                self.line_combo.setCurrentIndex(0)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            if event.pos().y() <= 30:  # 标题栏拖动
+                self.is_dragging = True
+                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            else:  # 检查是否在边缘开始调整大小
+                edge = self.get_resize_edge(event.pos())
+                if edge:
+                    self.resizing = True
+                    self.resize_edge = edge
+                    self.resize_start_pos = event.globalPos()
+                    self.start_geometry = self.geometry()
+
+    def mouseMoveEvent(self, event):
+        if self.is_dragging:
+            self.move(event.globalPos() - self.drag_position)
+        elif self.resizing:
+            self.resize_window(event.globalPos())
+        else:
+            # 更新鼠标样式
+            edge = self.get_resize_edge(event.pos())
+            if edge:
+                if edge in ["left", "right"]:
+                    self.setCursor(QtCore.Qt.SizeHorCursor)
+                elif edge in ["top", "bottom"]:
+                    self.setCursor(QtCore.Qt.SizeVerCursor)
+                elif edge in ["topleft", "bottomright"]:
+                    self.setCursor(QtCore.Qt.SizeFDiagCursor)
+                elif edge in ["topright", "bottomleft"]:
+                    self.setCursor(QtCore.Qt.SizeBDiagCursor)
+            else:
+                self.setCursor(QtCore.Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.is_dragging = False
+            self.resizing = False
+            self.resize_edge = None
+
+    def get_resize_edge(self, pos):
+        x = pos.x()
+        y = pos.y()
+        width = self.width()
+        height = self.height()
+
+        if y <= self.RESIZE_MARGIN:  # 上边缘
+            if x <= self.RESIZE_MARGIN:
+                return "topleft"
+            elif x >= width - self.RESIZE_MARGIN:
+                return "topright"
+            return "top"
+        elif y >= height - self.RESIZE_MARGIN:  # 下边缘
+            if x <= self.RESIZE_MARGIN:
+                return "bottomleft"
+            elif x >= width - self.RESIZE_MARGIN:
+                return "bottomright"
+            return "bottom"
+        elif x <= self.RESIZE_MARGIN:  # 左边缘
+            return "left"
+        elif x >= width - self.RESIZE_MARGIN:  # 右边缘
+            return "right"
+        return None
+
+    def resize_window(self, global_pos):
+        if not self.resize_edge:
+            return
+
+        diff = global_pos - self.resize_start_pos
+        new_geometry = QtCore.QRect(self.start_geometry)
+
+        if self.resize_edge in ["left", "topleft", "bottomleft"]:
+            new_geometry.setLeft(self.start_geometry.left() + diff.x())
+        if self.resize_edge in ["right", "topright", "bottomright"]:
+            new_geometry.setRight(self.start_geometry.right() + diff.x())
+        if self.resize_edge in ["top", "topleft", "topright"]:
+            new_geometry.setTop(self.start_geometry.top() + diff.y())
+        if self.resize_edge in ["bottom", "bottomleft", "bottomright"]:
+            new_geometry.setBottom(self.start_geometry.bottom() + diff.y())
+
+        # 设置最小尺寸
+        if new_geometry.width() >= 400 and new_geometry.height() >= 300:
+            self.setGeometry(new_geometry)
+
+    def query_errors(self):
+        print("\n=== Starting new query ===")
+        
+        # 如果正在查询,直接返回
+        if self._is_querying:
+            print("Warning: Another query is already running") 
+            QtWidgets.QMessageBox.warning(self, "提示", "查询正在进行中,请等待当前查询完成")
+            return
+            
+        try:
+            # 设置查询状态
+            self._is_querying = True
+            
+            # 禁用查询按钮
+            self.query_button.setEnabled(False)
+            
+            # 检查时间范围
+            start_time = self.start_time_input.dateTime()
+            end_time = self.end_time_input.dateTime()
+            
+            # 计算时间差(天数)
+            days_diff = start_time.daysTo(end_time)
+            
+            # 修改时间范围检查的对话框样式
+            if days_diff < 0:
+                msg_box = QtWidgets.QMessageBox(self)
+                msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+                msg_box.setWindowTitle("警告")
+                msg_box.setText("结束时间不能早于开始时间")
+                msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #333333;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                        font-size: 12px;
+                        padding: 10px;
+                    }
+                    QPushButton {
+                        background-color: #0078D7;
+                        color: white;
+                        border: none;
+                        padding: 8px;
+                        border-radius: 3px;
+                        min-width: 80px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1884D7;
+                    }
+                """)
+                msg_box.exec_()
+                return
+            
+            # 修改时间范围提示对话框样式
+            if days_diff > 30:
+                msg_box = QtWidgets.QMessageBox(self)
+                msg_box.setIcon(QtWidgets.QMessageBox.Question)
+                msg_box.setWindowTitle("提示")
+                msg_box.setText(f"您选择的时间范围为{days_diff}天,查询时间可能较长,是否继续?")
+                msg_box.setStandardButtons(
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+                )
+                msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #333333;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                        font-size: 12px;
+                        padding: 10px;
+                    }
+                    QPushButton {
+                        background-color: #0078D7;
+                        color: white;
+                        border: none;
+                        padding: 8px;
+                        border-radius: 3px;
+                        min-width: 80px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1884D7;
+                    }
+                """)
+                reply = msg_box.exec_()
+                if reply == QtWidgets.QMessageBox.No:
+                    return
+            
+            current_line = self.line_combo.currentText()
+            print(f"Selected line: {current_line}")
+            
+            if not current_line or current_line not in self.lines_dict:
+                msg_box = QtWidgets.QMessageBox(self)
+                msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+                msg_box.setWindowTitle("错误")
+                msg_box.setText("请选择有效的线别!")
+                msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #333333;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                        font-size: 12px;
+                        padding: 10px;
+                    }
+                    QPushButton {
+                        background-color: #0078D7;
+                        color: white;
+                        border: none;
+                        padding: 8px;
+                        border-radius: 3px;
+                        min-width: 80px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1884D7;
+                    }
+                """)
+                msg_box.exec_()
+                return
+            
+            folder_path = self.lines_dict[current_line]
+            print(f"Folder path: {folder_path}")
+            
+            # 添加网络路径警告
+            if is_network_path(folder_path):
+                msg_box = QtWidgets.QMessageBox(self)
+                msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+                msg_box.setWindowTitle("网络路径警告")
+                msg_box.setText(f"检测到网络路径:\n{folder_path}\n\n访问网络路径可能会导致程序响应变慢，特别是当目标文件夹正在被其他程序使用时。\n\n是否继续?")
+                msg_box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                msg_box.setStyleSheet(self._get_message_box_style())
+                reply = msg_box.exec_()
+                if reply == QtWidgets.QMessageBox.No:
+                    return
+            
+            # 检查路径是否存在
+            if not os.path.exists(folder_path):
+                print(f"Path does not exist: {folder_path}")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "错误",
+                    f"选择的路径不存在:\n{folder_path}"
+                )
+                return
+            
+            # 检查是否为目录
+            if not os.path.isdir(folder_path):
+                print(f"Path is not a directory: {folder_path}")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "错误",
+                    f"选择的路径不是一个目录:\n{folder_path}"
+                )
+                return
+            
+            material_code = self.material_code_input.text().strip()
+            position = self.position_input.text().strip()
+            
+            print(f"Query parameters:")
+            print(f"- Material code: {material_code}")
+            print(f"- Position: {position}") 
+            print(f"- Time range: {start_time.toString()} to {end_time.toString()}")
+
+            # 创建新的 worker 和线程
+            self._worker = QueryWorker()
+            self._worker_thread = QtCore.QThread()
+            
+            # 连接信号
+            self._worker.finished.connect(self._on_query_finished)
+            self._worker.result.connect(self.handle_query_result)
+            self._worker.error.connect(self.handle_query_error)
+            
+            # 连接清理信号
+            self._worker.finished.connect(self._cleanup_worker)
+            self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+            
+            # 移动 worker 到线程
+            self._worker.moveToThread(self._worker_thread)
+            
+            print("Setting up query execution...")
+            # 连接启动信号并使用正确的时间格式
+            self._worker_thread.started.connect(
+                lambda: self._worker.do_query(
+                    folder_path,
+                    material_code,
+                    start_time.toString("yyyyMMdd HH:mm"),  # 修改这里:使用固定格式
+                    end_time.toString("yyyyMMdd HH:mm"),    # 修改这里:使用固定格式
+                    position
+                )
+            )
+            
+            print("Creating progress dialog...")
+            # 创建进度对话框
+            self._progress_dialog = ProgressDialog(self._worker, self._worker_thread)
+            self._progress_dialog.cancelled.connect(self.cancel_query)
+            
+            print("Starting query execution...")
+            # 启动查询
+            self._progress_dialog.show()
+            self._worker_thread.start()
+            print("Query started successfully")
+            
+        except Exception as e:
+            print(f"Error starting query: {str(e)}")
+            self._is_querying = False
+            self.query_button.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "错误", f"启动查询时发生错误: {str(e)}")
+
+    def _cleanup_thread(self):
+        """清理线程和worker"""
+        try:
+            if self._worker_thread is not None and self._worker_thread.isRunning():
+                # 先取消当前操作
+                if self._worker is not None:
+                    self._worker.cancel()
+                
+                # 请求线程退出
+                self._worker_thread.quit()
+                
+                # 等待线程完成,设置超时
+                if not self._worker_thread.wait(3000): # 等待3秒
+                    print("警告:线程未能正常退出")
+                    self._worker_thread.terminate() # 强制终止
+                    self._worker_thread.wait()     # 再次等待完成
+                
+            # 不直接删除,让Qt事件循环处理
+            if self._worker is not None:
+                self._worker.deleteLater()
+                self._worker = None
+                
+            if self._worker_thread is not None:
+                self._worker_thread.deleteLater()
+                self._worker_thread = None
+                
+        except Exception as e:
+            print(f"清理线程时发生错误: {str(e)}")
+            # 确保变量被重置
+            self._worker = None
+            self._worker_thread = None
+
+    def _cleanup_worker(self):
+        """清理worker对象"""
+        try:
+            if self._worker is not None:
+                # 确保worker在主线程
+                if self._worker.thread() != QtCore.QThread.currentThread():
+                    self._worker.moveToThread(QtCore.QThread.currentThread())
+                self._worker.deleteLater()
+                self._worker = None
+        except Exception as e:
+            print(f"清理worker时发生错误: {str(e)}")
+            self._worker = None
+
+    def _on_query_finished(self):
+        """查询完成的处理"""
+        try:
+            print("Query finished signal received")
+            
+            # 先关闭进度对话框
+            if self._progress_dialog:
+                self._progress_dialog.program_closing = True
+                self._progress_dialog.close()
+                self._progress_dialog = None
+                
+            # 最后清理线程
+            self._cleanup_thread()
+            
+        except Exception as e:
+            print(f"查询完成处理时发生错误: {str(e)}")
+        finally:
+            self._is_querying = False
+            self.query_button.setEnabled(True)
+
+    def cancel_query(self):
+        """取消查询操作，增强版"""
+        try:
+            # 立即显示取消中提示
+            if self._progress_dialog:
+                self._progress_dialog.status_label.setText("正在取消操作...")
+                self._progress_dialog.detail_label.setText("请稍候，正在终止所有操作...")
+                QtWidgets.QApplication.processEvents()  # 强制处理事件，确保UI更新
+            
+            if self._worker:
+                self._worker.cancel()
+                
+            # 如果线程在超时后仍无法终止，则强制结束
+            killed = False
+            if self._worker_thread and self._worker_thread.isRunning():
+                self._worker_thread.quit()
+                if not self._worker_thread.wait(3000):  # 等待3秒
+                    self._worker_thread.terminate()     # 强制终止
+                    killed = True
+            
+            if self._progress_dialog:
+                self._progress_dialog.close()
+                self._progress_dialog = None
+            
+            if killed:
+                QtWidgets.QMessageBox.warning(self, "警告", "查询操作已强制终止，可能需要重启程序以恢复正常状态。")
+            else:
+                QtWidgets.QMessageBox.information(self, "提示", "查询已取消")
+            
+        finally:
+            self._is_querying = False
+            self.query_button.setEnabled(True)
+
+    def handle_query_result(self, count_dict):
+        # 更新表格列数
+        self.result_table.setColumnCount(4)
+        self.result_table.setHorizontalHeaderLabels(
+            ['物料代码', '位号', '报警次数', '占比(%)']
+        )
+        
+        # 检查是否有结果
+        if not count_dict:
+            msg_box = QtWidgets.QMessageBox(self)
+            msg_box.setIcon(QtWidgets.QMessageBox.Information)
+            msg_box.setWindowTitle("提示")
+            msg_box.setText("未找到符合条件的数据")
+            
+            # 修改MessageBox样式,确保文本可见
+            msg_box.setStyleSheet("""
+                QMessageBox {
+                    background-color: #333333;
+                }
+                QMessageBox QLabel {
+                    color: white;
+                    font-size: 12px;
+                    padding: 10px;
+                }
+                QPushButton {
+                    background-color: #0078D7;
+                    color: white;
+                    border: none;
+                    padding: 8px;
+                    border-radius: 3px;
+                    min-width: 80px;
+                }
+                QPushButton:hover {
+                    background-color: #1884D7;
+                }
+            """)
+            
+            msg_box.exec_()
+            self.result_table.setRowCount(0)
+            return
+        
+        # 隐藏行头（垂直表头）
+        self.result_table.verticalHeader().setVisible(False)
+        
+        # 计算总数
+        total_count = sum(count_dict.values())
+        
+        # 按报警次数排序
+        sorted_items = sorted(
+            count_dict.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        # 清空表格
+        self.result_table.setRowCount(0)
+        
+        # 填充数据
+        for (material_code, position), count in sorted_items:
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
+            
+            # 计算百分比
+            percentage = (count / total_count * 100) if total_count > 0 else 0
+            
+            # 设置单元格数据
+            self.result_table.setItem(row, 0, 
+                QtWidgets.QTableWidgetItem(str(material_code)))
+            self.result_table.setItem(row, 1, 
+                QtWidgets.QTableWidgetItem(str(position)))
+            self.result_table.setItem(row, 2, 
+                QtWidgets.QTableWidgetItem(str(count)))
+            self.result_table.setItem(row, 3,
+                QtWidgets.QTableWidgetItem(f"{percentage:.2f}%"))
+
+        # 保存导出数据,包含百分比
+        self.export_data = {
+            'items': sorted_items,
+            'total': total_count
+        }
+
+    def handle_query_error(self, error_msg):
+        """处理查询错误"""
+        try:
+            # 清理线程
+            self._cleanup_thread()
+            
+            # 关闭进度对话框
+            if self._progress_dialog:
+                self._progress_dialog.program_closing = True
+                self._progress_dialog.close()
+                self._progress_dialog = None
+            
+            # 创建错误对话框
+            error_dialog = QtWidgets.QDialog(self)
+            error_dialog.setWindowTitle("错误信息")
+            error_dialog.setMinimumWidth(500)
+            error_dialog.setMinimumHeight(300)
+            
+            layout = QtWidgets.QVBoxLayout(error_dialog)
+            
+            # 添加错误信息文本框
+            text_edit = QtWidgets.QTextEdit()
+            text_edit.setReadOnly(True)
+            text_edit.setPlainText(error_msg)
+            layout.addWidget(text_edit)
+            
+            # 添加关闭按钮
+            close_button = QtWidgets.QPushButton("关闭")
+            close_button.clicked.connect(error_dialog.close)
+            layout.addWidget(close_button)
+            
+            # 设置样式
+            error_dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #333333;
+                    color: white;
+                }
+                QTextEdit {
+                    background-color: #404040;
+                    color: white;
+                    border: 1px solid #555555;
+                    font-family: Consolas, Monospace;
+                }
+                QPushButton {
+                    background-color: #0078D7;
+                    color: white;
+                    border: none;
+                    padding: 8px;
+                    border-radius: 3px;
+                }
+                QPushButton:hover {
+                    background-color: #1884D7;
+                }
+            """)
+            
+            # 显示对话框
+            error_dialog.exec_()
+            
+        finally:
+            # 确保重置状态
+            self._is_querying = False
+            self.query_button.setEnabled(True)
+
+    def export_to_excel(self):
+        if not hasattr(self, 'export_data') or not self.export_data:
+            QtWidgets.QMessageBox.warning(self, "警告", "没有可导出的数据！")
+            return
+            
+        # 获取导出格式
+        formats = {
+            'Excel (*.xlsx)': self._export_excel,
+            'CSV (*.csv)': self._export_csv,
+            'HTML (*.html)': self._export_html
+        }
+        
+        format_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 
+            "保存文件", 
+            "", 
+            ";;".join(formats.keys())
+        )
+        
+        if not format_str:
+            return
+            
+        try:
+            # 调用对应的导出函数
+            for fmt, func in formats.items():
+                if fmt in format_str:
+                    func(format_str)
+                    break
+                    
+            QtWidgets.QMessageBox.information(self, "成功", "导出成功！")
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "错误",
+                f"导出失败: {str(e)}"
+            )
+            
+    def _export_excel(self, file_path):
+        """导出为Excel格式"""
+        df = self._get_export_dataframe()
+        df.to_excel(file_path, index=False)
+        
+    def _export_csv(self, file_path):
+        """导出为CSV格式"""
+        df = self._get_export_dataframe()
+        df.to_csv(file_path, index=False)
+        
+    def _export_html(self, file_path):
+        """导出为HTML格式"""
+        df = self._get_export_dataframe()
+        df.to_html(file_path, index=False)
+        
+    def _get_export_dataframe(self):
+        """获取要导出的数据框"""
+        sorted_items = self.export_data['items']
+        total_count = self.export_data['total']
+        
+        # 构建导出数据,包含更多统计信息
+        export_list = []
+        for (material_code, position), count in sorted_items:
+            percentage = (count/total_count*100)
+            export_list.append({
+                '物料代码': material_code,
+                '位号': position, 
+                '报警次数': count,
+                '占比(%)': f"{percentage:.2f}%",
+                '累计占比(%)': f"{sum(c for _, c in sorted_items[:len(export_list)+1])/total_count*100:.2f}%"
+            })
+            
+        return pd.DataFrame(export_list)
+
+    def closeEvent(self, event):
+        """窗口关闭事件处理"""
+        try:
+            self._cleanup_thread()
+            event.accept()
+        except Exception as e:
+            print(f"关闭窗口时发生错误: {str(e)}")
+            event.accept()
+
+    def _get_message_box_style(self):
+        return """
+            QMessageBox {
+                background-color: #333333;
+            }
+            QMessageBox QLabel {
+                color: white;
+                font-size: 12px;
+                padding: 10px;
+            }
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 3px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #1884D7;
+            }
+        """
+
+    def show_message(self, title, text, icon=QtWidgets.QMessageBox.Information):
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setIcon(icon)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(text)
+        msg_box.setStyleSheet(self._get_message_box_style())
+        return msg_box.exec_()
+
+def is_network_path(path):
+    """
+    检测路径是否为网络路径
+    
+    参数:
+        path: 要检查的路径
+        
+    返回:
+        bool: 如果是网络路径返回True，否则返回False
+    """
+    import platform
+    import os
+    
+    # 去除路径两端的空格
+    path = path.strip()
+    
+    # Windows系统下的网络路径检测
+    if platform.system() == "Windows":
+        # UNC路径 (以\\开头)
+        if path.startswith('\\\\'):
+            return True
+        
+        # 检查是否为映射的网络驱动器
+        # 只获取驱动器字母(例如从"C:\path"中获取"C:")
+        if len(path) > 1 and path[1] == ':':
+            drive = path[0].upper() + ':'
+            try:
+                import win32api
+                import win32con
+                drive_type = win32api.GetDriveType(drive)
+                if drive_type == win32con.DRIVE_REMOTE:
+                    return True
+            except ImportError:
+                # 如果没有win32api模块，使用简单的cmd命令判断
+                try:
+                    import subprocess
+                    # 使用net use命令获取映射的网络驱动器
+                    result = subprocess.run('net use', shell=True, capture_output=True, text=True)
+                    return drive.lower() in result.stdout.lower()
+                except:
+                    pass
+    
+    # Linux/Mac系统下的网络路径检测
+    else:
+        # 检查是否为NFS或SMB挂载点
+        if os.path.ismount(path):
+            try:
+                import subprocess
+                # 使用mount或df命令检查
+                result = subprocess.run(['mount'], capture_output=True, text=True)
+                if path in result.stdout and ('nfs' in result.stdout or 'smbfs' in result.stdout or 'cifs' in result.stdout):
+                    return True
+            except:
+                pass
+    
+    return False
+
+# 添加网络连接检测函数
+def check_network_connection(path):
+    """检查网络连接状态"""
+    if not is_network_path(path):
+        return True
+        
+    # 尝试快速访问路径，检测是否可达
+    try:
+        # 使用超时设置运行简单命令
+        import subprocess
+        import platform
+        
+        if platform.system() == "Windows":
+            # Windows上使用dir命令
+            process = subprocess.run(
+                f'dir "{path}" /B /A:-D',
+                shell=True,
+                capture_output=True,
+                timeout=5
+            )
+            return process.returncode == 0
+        else:
+            # Linux/Mac上使用ls命令
+            process = subprocess.run(
+                f'ls -la "{path}" | head -n 1',
+                shell=True,
+                capture_output=True,
+                timeout=5
+            )
+            return process.returncode == 0
+    except:
+        return False
+
+if __name__ == "__main__":
+    try:
+        app = QtWidgets.QApplication([])
+        window = OTRStatisticsApp()
+        window.show()
+        app.exec_()
+    except Exception as e:
+        # 显示错误对话框
+        error_dialog = QtWidgets.QMessageBox()
+        error_dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        error_dialog.setWindowTitle("错误")
+        error_dialog.setText("程序启动时发生错误")
+        error_dialog.setDetailedText(str(e))
+        error_dialog.exec_()
