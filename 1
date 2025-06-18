@@ -396,6 +396,18 @@ class QueryWorker(QObject):
         max_scan_count = 100000  # 设置最大扫描文件数，防止无限循环
 
         try:
+            # 调试信息：打印时间过滤参数
+            if start_timestamp is not None and end_timestamp is not None:
+                import datetime
+                start_dt = datetime.datetime.fromtimestamp(start_timestamp)
+                end_dt = datetime.datetime.fromtimestamp(end_timestamp)
+                print(f"目录扫描时间过滤:")
+                print(f"  开始时间戳: {start_timestamp} -> {start_dt}")
+                print(f"  结束时间戳: {end_timestamp} -> {end_dt}")
+                print(f"  时间范围: {(end_timestamp - start_timestamp)/86400:.1f} 天")
+            else:
+                print("目录扫描: 无时间过滤")
+
             self.status_update.emit("正在扫描目录结构...")
 
             # 使用更安全的目录遍历方式，避免符号链接问题
@@ -447,6 +459,18 @@ class QueryWorker(QObject):
                         try:
                             file_stats = os.stat(file_path)
                             file_timestamp = file_stats.st_mtime
+
+                            # 调试信息：打印前几个文件的时间比较
+                            if filtered_count < 3:  # 只打印前3个符合条件的文件
+                                import datetime
+                                file_dt = datetime.datetime.fromtimestamp(file_timestamp)
+                                start_dt = datetime.datetime.fromtimestamp(start_timestamp)
+                                end_dt = datetime.datetime.fromtimestamp(end_timestamp)
+                                print(f"文件时间检查: {os.path.basename(file_path)}")
+                                print(f"  文件时间: {file_timestamp} -> {file_dt}")
+                                print(f"  开始时间: {start_timestamp} -> {start_dt}")
+                                print(f"  结束时间: {end_timestamp} -> {end_dt}")
+                                print(f"  在范围内: {start_timestamp <= file_timestamp <= end_timestamp}")
 
                             # 只有在时间范围内的文件才添加
                             if start_timestamp <= file_timestamp <= end_timestamp:
@@ -1526,6 +1550,12 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             # 将QDateTime转换为时间戳，避免字符串格式问题
             start_timestamp = start_time.toSecsSinceEpoch()
             end_timestamp = end_time.toSecsSinceEpoch()
+
+            # 调试信息：打印时间戳
+            print(f"UI时间范围:")
+            print(f"  开始时间: {start_time.toString('yyyy-MM-dd hh:mm:ss')} -> 时间戳: {start_timestamp}")
+            print(f"  结束时间: {end_time.toString('yyyy-MM-dd hh:mm:ss')} -> 时间戳: {end_timestamp}")
+            print(f"  时间戳差值: {end_timestamp - start_timestamp} 秒 ({(end_timestamp - start_timestamp)/86400:.1f} 天)")
 
             self._worker_thread.started.connect(
                 lambda: self._worker.do_query(
