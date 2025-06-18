@@ -303,37 +303,26 @@ class QueryWorker(QObject):
             return self._is_cancelled
 
     def _update_progress(self, current: int, total: int, message: str = ""):
-        """更新进度并计算剩余时间"""
+        """更新进度，针对大量文件优化"""
         if total <= 0:
             return
 
         progress = int((current / total) * 100)
-        self.progress.emit(progress)
 
-        # 计算剩余时间
-        if self._start_time and current > 0:
-            elapsed = time.time() - self._start_time
-            if elapsed > 0:  # 防止除零错误
-                rate = current / elapsed
-                if rate > 0:
-                    remaining = (total - current) / rate
-                    eta_str = f" (预计剩余: {int(remaining//60)}分{int(remaining%60)}秒)"
-                else:
-                    eta_str = ""
-            else:
-                eta_str = ""
-        else:
-            eta_str = ""
+        # 只在进度有明显变化时才更新UI（提高阈值）
+        if not hasattr(self, '_last_progress') or abs(progress - self._last_progress) >= 5:
+            self.progress.emit(progress)
+            self._last_progress = progress
 
-        status_msg = f"{message} {current}/{total}{eta_str}"
-        self.status_update.emit(status_msg)
+        # 大幅减少状态消息更新频率
+        if current % 1000 == 0 or current == total:
+            status_msg = f"{message} {current}/{total}"
+            self.status_update.emit(status_msg)
             
     def _scan_directory(self, path, start_time, end_time):
-        """优化的目录扫描函数，添加活跃目录处理和超时控制"""
+        """高性能目录扫描函数，针对大量文件优化"""
         try:
             files = []
-            print(f"\n开始扫描目录: {path}")
-            print(f"查询时间范围: {start_time} 到 {end_time}")
 
             scanned_count = 0
             matched_count = 0
@@ -341,199 +330,201 @@ class QueryWorker(QObject):
 
             # 检测是否为网络路径
             network_path = is_network_path(path)
-            if network_path:
-                print("检测到网络路径，将应用特殊处理")
 
-            # 使用线程池加速扫描，但限制并发数避免资源竞争
-            max_workers = 2 if network_path else 4
+            # 针对大量文件优化线程池设置
+            max_workers = 2 if network_path else 4  # 适当增加并发数以提高处理速度
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
             try:
                 futures = []
 
-                # 使用安全的目录遍历方式
-                try:
-                    # 先获取目录快照，避免在遍历过程中目录结构变化
-                    directory_snapshot = self._get_directory_snapshot(path)
-                    # directory_snapshot 已经只包含 .otr 文件
-                    total_otr_files = len(directory_snapshot)
-                    self._total_count = total_otr_files
-                    self._start_time = time.time()
+                # 获取目录快照
+                directory_snapshot = self._get_directory_snapshot(path)
+                total_otr_files = len(directory_snapshot)
+                self._total_count = total_otr_files
+                self._start_time = time.time()
 
-                    print(f"找到 {total_otr_files} 个 .otr 文件，开始处理...")
-                    self.status_update.emit(f"找到 {total_otr_files} 个文件，开始处理...")
+                self.status_update.emit(f"开始处理 {total_otr_files} 个文件...")
 
-                    # 检查是否有文件需要处理
-                    if total_otr_files == 0:
-                        print("警告: 目录快照中没有找到 .otr 文件")
+                # 检查是否有文件需要处理
+                if total_otr_files == 0:
+                    self.status_update.emit("未找到 .otr 文件")
+                    return []
+
+                # 使用更大的批次，减少循环开销
+                batch_size = 500  # 增加批次大小
+                for i in range(0, len(directory_snapshot), batch_size):
+                    if self._check_cancelled():
                         return []
 
-                    # 分批处理文件，避免内存占用过大
-                    batch_size = 100
-                    for i in range(0, len(directory_snapshot), batch_size):
+                    batch = directory_snapshot[i:i + batch_size]
+
+                    for file_path in batch:
                         if self._check_cancelled():
-                            print("扫描被取消")
                             return []
 
-                        batch = directory_snapshot[i:i + batch_size]
+                        scanned_count += 1
 
-                        for file_path in batch:
-                            if self._check_cancelled():
-                                print("扫描被取消")
-                                return []
+                        # 大幅减少状态更新频率，避免UI阻塞
+                        if scanned_count % 5000 == 0:
+                            self.status_update.emit(f"正在处理第 {scanned_count}/{total_otr_files} 个文件")
+                            # 强制处理UI事件，保持响应
+                            QtWidgets.QApplication.processEvents()
 
-                            # directory_snapshot 已经只包含 .otr 文件，无需再次检查
-                            scanned_count += 1
-
-                            # 添加调试信息
-                            if scanned_count <= 5 or scanned_count % 100 == 0:
-                                print(f"正在处理第 {scanned_count} 个文件: {os.path.basename(file_path)}")
-
-                            # 更新进度
+                        # 减少进度更新频率
+                        if scanned_count % 200 == 0:
                             self._update_progress(scanned_count, total_otr_files, "扫描文件")
 
-                            # 为活跃目录使用更短的超时时间
-                            timeout = 3 if network_path else 2
-                            futures.append(
-                                self._executor.submit(self._check_file_safe,
-                                                 file_path,
-                                                 start_time,
-                                                 end_time,
-                                                 timeout)
-                            )
+                        # 使用较短的超时时间
+                        timeout = 1 if network_path else 1
+                        futures.append(
+                            self._executor.submit(self._check_file_safe,
+                                             file_path,
+                                             start_time,
+                                             end_time,
+                                             timeout)
+                        )
 
-                    # 收集结果，使用超时控制
-                    total_futures = len(futures)
-                    completed_count = 0
+                # 收集结果，针对大量文件优化
+                total_futures = len(futures)
+                completed_count = 0
 
-                    try:
-                        completed_futures = concurrent.futures.as_completed(futures, timeout=300)  # 5分钟总超时
+                try:
+                    # 增加总超时时间，适应大量文件处理
+                    completed_futures = concurrent.futures.as_completed(futures, timeout=1800)  # 30分钟总超时
 
-                        for future in completed_futures:
-                            if self._check_cancelled():
-                                print("扫描被取消")
-                                return []
+                    for future in completed_futures:
+                        if self._check_cancelled():
+                            return []
 
-                            completed_count += 1
+                        completed_count += 1
 
-                            # 更新进度
+                        # 大幅减少进度更新频率，避免UI阻塞
+                        if completed_count % 1000 == 0:
                             self._update_progress(completed_count, total_futures, "处理文件")
+                            # 强制处理UI事件，保持响应
+                            QtWidgets.QApplication.processEvents()
 
-                            try:
-                                result = future.result(timeout=5)  # 单个任务5秒超时
-                                if result:
-                                    matched_count += 1
-                                    files.append(result)
-                            except concurrent.futures.TimeoutError:
-                                error_count += 1
-                                if error_count % 10 == 0:  # 减少日志频率
-                                    print(f"已有 {error_count} 个文件处理超时")
-                            except Exception as e:
-                                error_count += 1
-                                if error_count % 10 == 0:
-                                    print(f"已有 {error_count} 个文件处理出错")
+                        try:
+                            result = future.result(timeout=3)  # 单个任务3秒超时
+                            if result:
+                                matched_count += 1
+                                files.append(result)
+                        except concurrent.futures.TimeoutError:
+                            error_count += 1
+                        except Exception as e:
+                            error_count += 1
 
-                    except concurrent.futures.TimeoutError:
-                        print("整体扫描超时，返回已收集的结果")
-                        # 取消剩余的任务
-                        for future in futures:
-                            future.cancel()
-
-                except Exception as e:
-                    print(f"目录遍历出错: {str(e)}")
-                    return []
+                except concurrent.futures.TimeoutError:
+                    self.status_update.emit("处理超时，返回已收集的结果")
+                    # 取消剩余的任务
+                    for future in futures:
+                        future.cancel()
 
             finally:
                 # 确保线程池被正确关闭
                 if self._executor:
                     try:
-                        self._executor.shutdown(wait=True)
-                    except Exception as e:
-                        print(f"关闭线程池时出错: {str(e)}")
+                        self._executor.shutdown(wait=False)  # 不等待，快速关闭
+                    except Exception:
+                        pass
                     finally:
                         self._executor = None
 
-            print(f"\n扫描完成:")
-            print(f"- 总扫描文件数: {scanned_count}")
-            print(f"- 符合时间条件的文件数: {matched_count}")
-            print(f"- 错误/超时文件数: {error_count}")
+            # 简化结果报告
+            self.status_update.emit(f"扫描完成: 处理{scanned_count}个文件，匹配{matched_count}个")
 
-            # 如果错误率过高，给出警告
-            if scanned_count > 0 and error_count / scanned_count > 0.3:
-                print(f"警告: 错误率较高 ({error_count}/{scanned_count} = {error_count/scanned_count*100:.1f}%)")
-                print("建议检查目录访问权限或等待文件操作完成后重试")
-            elif scanned_count == 0 and error_count > 0:
-                print(f"警告: 所有文件处理都失败了 (错误数: {error_count})")
-                print("建议检查目录访问权限或网络连接状态")
+            # 只在错误率很高时才警告
+            if scanned_count > 0 and error_count / scanned_count > 0.5:
+                self.status_update.emit(f"警告: 错误率较高，建议检查目录权限")
 
             return files
 
         except Exception as e:
-            print(f"扫描目录出错: {str(e)}")
+            error_msg = f"扫描目录出错: {str(e)}"
+            self.status_update.emit(error_msg)
             return []
             
     def _get_directory_snapshot(self, path):
-        """获取目录快照，内存优化版本"""
+        """获取目录快照，针对大量文件优化版本"""
         files = []
         file_count = 0
-        max_files = 10000  # 限制最大文件数，避免内存溢出
+        max_files = 50000  # 大幅提高文件数限制，适应几个月的文件
+        progress_interval = 1000  # 每1000个文件更新一次进度，减少UI更新频率
 
         try:
-            print(f"正在获取目录快照: {path}")
+            self.status_update.emit("正在扫描目录结构...")
 
-            # 使用生成器方式，减少内存占用
+            # 使用更高效的目录遍历方式
             for root, dirs, filenames in os.walk(path):
                 if self._check_cancelled():
                     break
 
-                # 限制扫描深度
+                # 适当限制扫描深度，但不要太严格
                 depth = root[len(path):].count(os.sep)
-                if depth >= 10:
-                    dirs[:] = []  # 不再深入子目录
+                if depth >= 10:  # 允许更深的目录结构
+                    dirs[:] = []
                     continue
 
-                for filename in filenames:
+                # 过滤出.otr文件，减少后续处理
+                otr_files = [f for f in filenames if f.endswith('.otr')]
+
+                for filename in otr_files:
                     if self._check_cancelled():
                         break
 
-                    if filename.endswith('.otr'):
-                        file_count += 1
+                    file_count += 1
 
-                        # 内存保护：如果文件数量过多，只处理最新的文件
-                        if file_count > max_files:
-                            print(f"文件数量超过限制({max_files})，将只处理最新的文件")
-                            # 按修改时间排序，只保留最新的文件
-                            try:
-                                file_path = os.path.join(root, filename)
-                                stat_info = os.stat(file_path)
-                                files.append((file_path, stat_info.st_mtime))
+                    # 减少进度更新频率，避免UI阻塞
+                    if file_count % progress_interval == 0:
+                        self.status_update.emit(f"已发现 {file_count} 个文件...")
+                        # 强制处理UI事件，保持响应
+                        QtWidgets.QApplication.processEvents()
 
-                                # 每1000个文件排序一次，保持内存使用稳定
-                                if len(files) % 1000 == 0:
-                                    files.sort(key=lambda x: x[1], reverse=True)
-                                    files = files[:max_files//2]  # 只保留一半最新的
+                    file_path = os.path.join(root, filename)
 
-                            except (OSError, PermissionError):
-                                continue
-                        else:
-                            file_path = os.path.join(root, filename)
-                            files.append((file_path, 0))  # 不需要时间信息时使用0
+                    # 简化文件信息收集，直接添加路径
+                    try:
+                        files.append(file_path)
+                    except (OSError, PermissionError):
+                        continue
 
-            # 最终处理：如果使用了时间排序，提取文件路径
-            if file_count > max_files:
-                files.sort(key=lambda x: x[1], reverse=True)
-                files = [f[0] for f in files[:max_files]]
-            else:
-                files = [f[0] for f in files]
+                    # 如果文件数量非常多，定期检查取消状态
+                    if file_count % 5000 == 0:
+                        if self._check_cancelled():
+                            break
 
-            print(f"目录快照获取完成，找到 {len(files)} 个 .otr 文件")
-            if file_count > max_files:
-                print(f"注意：总共发现 {file_count} 个文件，已优化为处理最新的 {len(files)} 个")
+            self.status_update.emit(f"目录扫描完成，找到 {len(files)} 个文件")
+
+            # 如果文件数量超过限制，只处理最新的文件
+            if len(files) > max_files:
+                self.status_update.emit(f"文件数量过多，将只处理最新的 {max_files} 个文件")
+                # 按文件修改时间排序，保留最新的
+                try:
+                    files_with_time = []
+                    for i, file_path in enumerate(files):
+                        if i % 1000 == 0:
+                            self.status_update.emit(f"正在排序文件 {i}/{len(files)}...")
+                            QtWidgets.QApplication.processEvents()
+                        try:
+                            stat_info = os.stat(file_path)
+                            files_with_time.append((file_path, stat_info.st_mtime))
+                        except (OSError, PermissionError):
+                            continue
+
+                    files_with_time.sort(key=lambda x: x[1], reverse=True)
+                    files = [f[0] for f in files_with_time[:max_files]]
+                    self.status_update.emit(f"已优化为处理最新的 {len(files)} 个文件")
+                except Exception as e:
+                    # 如果排序失败，直接截取前面的文件
+                    files = files[:max_files]
+                    self.status_update.emit(f"排序失败，处理前 {len(files)} 个文件")
 
             return files
 
         except Exception as e:
-            print(f"获取目录快照失败: {str(e)}")
+            error_msg = f"获取目录快照失败: {str(e)}"
+            self.status_update.emit(error_msg)
             return []
 
     def _list_directory_safe(self, directory):
@@ -553,104 +544,61 @@ class QueryWorker(QObject):
             print(f"无法列出目录内容 {directory}: {str(e)}")
             return []
 
-    def _check_file_safe(self, file_path, start_time, end_time, timeout=2):
-        """安全的文件检查，处理活跃目录中的文件访问"""
+    def _check_file_safe(self, file_path, start_time, end_time, timeout=1):
+        """安全的文件检查，高性能版本"""
         try:
-            # 使用超时控制
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self._check_file_with_retry, file_path, start_time, end_time)
-                try:
-                    return future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    print(f"文件检查超时: {os.path.basename(file_path)}")
-                    return None
-        except Exception as e:
-            print(f"文件检查出错: {os.path.basename(file_path)}: {str(e)}")
+            # 直接调用检查方法，避免额外的线程池开销
+            return self._check_file_with_retry(file_path, start_time, end_time)
+        except Exception:
             return None
 
     def _check_file_with_retry(self, file_path, start_time, end_time):
-        """带重试机制的文件检查，增强异常处理"""
-        max_retries = 3
-        last_error = None
+        """带重试机制的文件检查，高性能版本"""
+        max_retries = 2  # 减少重试次数
 
         for attempt in range(max_retries):
             try:
-                # 首先检查文件是否存在且可访问
+                # 快速检查文件是否存在
                 if not os.path.exists(file_path):
                     return None
 
-                # 检查文件是否被锁定（正在写入）
-                if self._is_file_locked(file_path):
-                    if attempt < max_retries - 1:
-                        time.sleep(0.2 * (attempt + 1))  # 递增等待时间
-                        continue
-                    else:
-                        print(f"文件被锁定，跳过: {os.path.basename(file_path)}")
-                        return None
+                # 简化文件锁定检查
+                if attempt == 0 and self._is_file_locked_simple(file_path):
+                    time.sleep(0.1)
+                    continue
 
-                # 获取文件创建时间
+                # 获取文件时间信息
                 file_stats = os.stat(file_path)
-                # 使用修改时间而不是创建时间，更可靠
                 create_time = file_stats.st_mtime
                 create_time_str = time.strftime('%Y%m%d %H:%M',
                                               time.localtime(create_time))
 
-                # 检查文件是否在时间范围内
+                # 检查时间范围
                 if start_time <= create_time_str <= end_time:
                     return file_path
 
                 return None
 
-            except FileNotFoundError:
-                # 文件在检查过程中被删除，直接返回
+            except (FileNotFoundError, PermissionError, OSError):
+                if attempt < max_retries - 1:
+                    time.sleep(0.05)  # 更短的等待时间
+                    continue
                 return None
-            except PermissionError as e:
-                last_error = f"权限错误: {str(e)}"
-                if attempt < max_retries - 1:
-                    time.sleep(0.1 * (attempt + 1))
-                    continue
-                else:
-                    print(f"跳过文件 {os.path.basename(file_path)}: {last_error}")
-                    return None
-            except OSError as e:
-                last_error = f"系统错误: {str(e)}"
-                if attempt < max_retries - 1:
-                    time.sleep(0.1 * (attempt + 1))
-                    continue
-                else:
-                    print(f"跳过文件 {os.path.basename(file_path)}: {last_error}")
-                    return None
-            except Exception as e:
-                last_error = f"未知错误: {str(e)}"
-                print(f"检查文件时发生未知错误 {os.path.basename(file_path)}: {last_error}")
+            except Exception:
                 return None
 
         return None
 
-    def _is_file_locked(self, file_path):
-        """安全检查文件是否被锁定（正在被其他进程写入）"""
+    def _is_file_locked_simple(self, file_path):
+        """简化的文件锁定检查，提高性能"""
         try:
-            # 使用只读模式检查，避免意外修改文件
+            # 简单的文件访问测试
             with open(file_path, 'rb') as f:
-                # 尝试获取文件锁（Windows特有）
-                if os.name == 'nt':
-                    try:
-                        import msvcrt
-                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                    except (ImportError, OSError):
-                        # 如果无法获取锁或模块不存在，假设文件未锁定
-                        pass
-                # 检查文件大小是否在短时间内变化（更安全的方法）
-                initial_size = f.seek(0, 2)  # 移动到文件末尾获取大小
-                time.sleep(0.1)
-                current_size = f.seek(0, 2)
-                return initial_size != current_size
+                f.read(1)  # 尝试读取1字节
             return False
         except (PermissionError, OSError):
             return True
-        except Exception as e:
-            print(f"检查文件锁定状态时出错 {file_path}: {str(e)}")
+        except Exception:
             return False
 
     def _check_file(self, file_path, start_time, end_time):
@@ -683,86 +631,76 @@ class QueryWorker(QObject):
             return None
             
     def do_query(self, path, material_code, start_time, end_time, position=None):
-        """执行查询"""
+        """执行查询，针对大量文件优化版本"""
         try:
-            print(f"\n开始执行查询:")
-            print(f"- 路径: {path}")
-            print(f"- 物料代码: {material_code}")
-            print(f"- 位号: {position}")
-            print(f"- 时间范围: {start_time} 到 {end_time}")
-            
             # 重置状态
             self._is_cancelled = False
             self.results = []
-            
+
+            self.status_update.emit("开始查询...")
+
             # 扫描文件
             files = self._scan_directory(path, start_time, end_time)
             if not files:
-                print("未找到符合条件的文件")
                 self.error.emit("未找到符合条件的文件")
                 return
-                
+
             total_files = len(files)
             processed = 0
             matched_files = 0
-            
-            # 处理文件
+
+            self.status_update.emit(f"开始分析 {total_files} 个文件...")
+
+            # 处理文件 - 针对大量文件优化
             for file_path in files:
                 if self._check_cancelled():
-                    print("查询被取消")
                     return
-                    
+
                 try:
                     file_info = self._process_file(file_path)
                     if file_info:
                         # 提取物料代码和位号
                         file_name = os.path.basename(file_path)
                         extracted_info = self.extract_info(file_name)
-                        
+
                         if extracted_info:
                             mat_code, pos = extracted_info
-                            
-                            # 添加筛选条件的日志
-                            print(f"\n检查文件是否符合筛选条件:")
-                            print(f"- 文件: {file_name}")
-                            print(f"- 物料代码匹配: {not material_code or mat_code == material_code}")
-                            print(f"- 位号匹配: {not position or pos == position}")
-                            
-                            # 筛选逻辑
+
+                            # 筛选逻辑（移除调试输出）
                             if (not material_code or mat_code == material_code) and \
                                (not position or pos == position):
                                 matched_files += 1
                                 self.results.append((mat_code, pos))
-                                
-                except Exception as e:
-                    print(f"处理文件出错 {file_path}: {str(e)}")
+
+                except Exception:
                     continue
-                    
+
                 processed += 1
-                self.progress.emit(int((processed / total_files) * 100))
-                
+
+                # 大幅减少进度更新频率，避免UI阻塞
+                if processed % 500 == 0 or processed == total_files:
+                    self.progress.emit(int((processed / total_files) * 100))
+
+                # 定期更新状态并处理UI事件
+                if processed % 2000 == 0:
+                    self.status_update.emit(f"已分析 {processed}/{total_files} 个文件，匹配 {matched_files} 个")
+                    # 强制处理UI事件，保持响应
+                    QtWidgets.QApplication.processEvents()
+
             # 统计结果
             count_dict = {}
             for mat_code, pos in self.results:
                 key = (mat_code, pos)
                 count_dict[key] = count_dict.get(key, 0) + 1
-                
-            print(f"\n查询完成:")
-            print(f"- 总文件数: {total_files}")
-            print(f"- 处理文件数: {processed}")
-            print(f"- 符合条件文件数: {matched_files}")
-            print(f"- 统计结果: {count_dict}")
-            
+
+            self.status_update.emit(f"查询完成: 处理{processed}个文件，匹配{matched_files}个")
+
             # 发送结果
             if not self._is_cancelled:
                 self.result.emit(count_dict)
-                
-            # 发送完成信号
-            self.finished.emit()
-            
+
         except Exception as e:
             error_msg = f"查询过程发生错误: {str(e)}"
-            print(error_msg)
             self.error.emit(error_msg)
         finally:
             # 确保在所有情况下都发出完成信号
@@ -779,61 +717,66 @@ class QueryWorker(QObject):
         例如: 0800278_U201_1_20250123-120022.otr
         """
         try:
-            print(f"\n解析文件名: {file_name}")
-            
             # 分割文件名,去掉扩展名
             name_without_ext = os.path.splitext(file_name)[0]
-            
+
             # 按下划线分割
             parts = name_without_ext.split('_')
-            
+
             if len(parts) >= 4:  # 确保至少有4个部分
                 material_code = parts[0]  # 第一部分是物料代码
                 position = parts[1]       # 第二部分是位号
-                
-                print(f"解析结果:")
-                print(f"- 物料代码: {material_code}")
-                print(f"- 位号: {position}")
-                
                 return material_code, position
-                
-            print(f"文件名格式无效: {file_name}")
-            print(f"- 分割后部分: {parts}")
+
             return None, None
-            
-        except Exception as e:
-            print(f"解析文件名出错 {file_name}: {str(e)}")
+
+        except Exception:
             return None, None
 
 
 class ProgressDialog(QDialog):
     cancelled = pyqtSignal()
-    
+
     def __init__(self, worker, worker_thread):
         super().__init__()
         self.worker = worker
         self.worker_thread = worker_thread
         self.program_closing = False  # 添加标志
-        
-        # 移除复杂的状态标志
-        self.setWindowTitle("处理中")
-        self.setFixedSize(300, 150)
+
+        # 针对大量文件处理优化界面
+        self.setWindowTitle("处理中 - 请耐心等待")
+        self.setFixedSize(400, 200)  # 增加窗口大小
         self.setWindowFlags(QtCore.Qt.Dialog | QtCore.Qt.FramelessWindowHint)
-        
+
         layout = QtWidgets.QVBoxLayout(self)
-        
+
+        # 主状态标签
+        self.status_label = QtWidgets.QLabel("正在处理文件...", self)
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        # 进度条
         self.progress_bar = QtWidgets.QProgressBar(self)
         self.progress_bar.setTextVisible(True)
-        self.status_label = QtWidgets.QLabel("正在处理文件...", self)
+        self.progress_bar.setFormat("%p% (%v/%m)")  # 显示百分比和数值
+
+        # 详细进度信息标签
+        self.detail_label = QtWidgets.QLabel("准备开始扫描...", self)
+        self.detail_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.detail_label.setWordWrap(True)  # 允许文本换行
+
+        # 提示标签
+        self.tip_label = QtWidgets.QLabel("处理大量文件需要时间，请不要关闭程序", self)
+        self.tip_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.tip_label.setStyleSheet("color: #888888; font-size: 10px;")
+
+        # 取消按钮
         self.cancel_button = QtWidgets.QPushButton("取消", self)
         self.cancel_button.clicked.connect(self.cancelled.emit)
-        
-        # 添加详细进度信息标签
-        self.detail_label = QtWidgets.QLabel("准备开始扫描...", self)
-        layout.insertWidget(1, self.detail_label)
-        
+
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
+        layout.addWidget(self.detail_label)
+        layout.addWidget(self.tip_label)
         layout.addWidget(self.cancel_button)
         
         self.setStyleSheet("""
@@ -844,6 +787,7 @@ class ProgressDialog(QDialog):
             }
             QLabel {
                 color: white;
+                padding: 5px;
             }
             QProgressBar {
                 border: 1px solid #555555;
@@ -851,10 +795,23 @@ class ProgressDialog(QDialog):
                 text-align: center;
                 color: white;
                 background-color: #404040;
+                height: 25px;
+                font-size: 12px;
             }
             QProgressBar::chunk {
                 background-color: #0078D7;
                 border-radius: 2px;
+            }
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 3px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #1884D7;
             }
         """)
         
@@ -1412,20 +1369,27 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             self.setGeometry(new_geometry)
 
     def query_errors(self):
-        print("\n=== Starting new query ===")
-        
         # 如果正在查询,直接返回
         if self._is_querying:
-            print("Warning: Another query is already running") 
             QtWidgets.QMessageBox.warning(self, "提示", "查询正在进行中,请等待当前查询完成")
             return
-            
+
         try:
             # 设置查询状态
             self._is_querying = True
-            
+
             # 禁用查询按钮
             self.query_button.setEnabled(False)
+
+            # 快速预检查文件数量
+            current_line = self.line_combo.currentText()
+            if current_line and current_line in self.lines_dict:
+                folder_path = self.lines_dict[current_line]
+                if self._quick_file_count_check(folder_path):
+                    # 如果用户选择取消，则退出
+                    self._is_querying = False
+                    self.query_button.setEnabled(True)
+                    return
             
             # 检查时间范围
             start_time = self.start_time_input.dateTime()
@@ -1499,8 +1463,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
                     return
             
             current_line = self.line_combo.currentText()
-            print(f"Selected line: {current_line}")
-            
+
             if not current_line or current_line not in self.lines_dict:
                 msg_box = QtWidgets.QMessageBox(self)
                 msg_box.setIcon(QtWidgets.QMessageBox.Warning)
@@ -1531,8 +1494,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
                 return
             
             folder_path = self.lines_dict[current_line]
-            print(f"Folder path: {folder_path}")
-            
+
             # 添加网络路径和活跃目录警告
             if is_network_path(folder_path):
                 msg_box = QtWidgets.QMessageBox(self)
@@ -1550,31 +1512,24 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             
             # 检查路径是否存在
             if not os.path.exists(folder_path):
-                print(f"Path does not exist: {folder_path}")
                 QtWidgets.QMessageBox.warning(
                     self,
                     "错误",
                     f"选择的路径不存在:\n{folder_path}"
                 )
                 return
-            
+
             # 检查是否为目录
             if not os.path.isdir(folder_path):
-                print(f"Path is not a directory: {folder_path}")
                 QtWidgets.QMessageBox.warning(
                     self,
                     "错误",
                     f"选择的路径不是一个目录:\n{folder_path}"
                 )
                 return
-            
+
             material_code = self.material_code_input.text().strip()
             position = self.position_input.text().strip()
-            
-            print(f"Query parameters:")
-            print(f"- Material code: {material_code}")
-            print(f"- Position: {position}") 
-            print(f"- Time range: {start_time.toString()} to {end_time.toString()}")
 
             # 创建新的 worker 和线程
             self._worker = QueryWorker()
@@ -1590,8 +1545,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
 
             # 移动 worker 到线程
             self._worker.moveToThread(self._worker_thread)
-            
-            print("Setting up query execution...")
+
             # 连接启动信号并使用正确的时间格式
             self._worker_thread.started.connect(
                 lambda: self._worker.do_query(
@@ -1602,26 +1556,20 @@ class OTRStatisticsApp(QtWidgets.QWidget):
                     position
                 )
             )
-            
-            print("Creating progress dialog...")
+
             # 创建进度对话框
             self._progress_dialog = ProgressDialog(self._worker, self._worker_thread)
             self._progress_dialog.cancelled.connect(self.cancel_query)
-            
-            print("Starting query execution...")
+
             # 启动查询
             self._progress_dialog.show()
             self._worker_thread.start()
-            print("Query started successfully")
             
         except Exception as e:
-            print(f"Error starting query: {str(e)}")
             QtWidgets.QMessageBox.critical(self, "错误", f"启动查询时发生错误: {str(e)}")
-        finally:
-            # 确保在异常情况下也重置状态
-            if 'self._worker' not in locals() or not self._worker:
-                self._is_querying = False
-                self.query_button.setEnabled(True)
+            # 在异常情况下重置状态
+            self._is_querying = False
+            self.query_button.setEnabled(True)
 
     def _cleanup_thread(self):
         """增强的线程和资源清理"""
@@ -1927,12 +1875,17 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             
         try:
             # 调用对应的导出函数
+            exported = False
             for fmt, func in formats.items():
                 if fmt in format_str:
                     func(format_str)
+                    exported = True
                     break
-                    
-            QtWidgets.QMessageBox.information(self, "成功", "导出成功！")
+
+            if exported:
+                QtWidgets.QMessageBox.information(self, "成功", "导出成功！")
+            else:
+                QtWidgets.QMessageBox.warning(self, "警告", "未知的文件格式！")
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1949,7 +1902,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
     def _export_csv(self, file_path):
         """导出为CSV格式"""
         df = self._get_export_dataframe()
-        df.to_csv(file_path, index=False)
+        df.to_csv(file_path, index=False, encoding='utf-8-sig')  # 添加BOM以支持中文
         
     def _export_html(self, file_path):
         """导出为HTML格式"""
@@ -2095,6 +2048,45 @@ class OTRStatisticsApp(QtWidgets.QWidget):
         msg_box.setStandardButtons(QtWidgets.QMessageBox.Ok)
         msg_box.setStyleSheet(self._get_message_box_style())
         msg_box.exec_()
+
+    def _quick_file_count_check(self, path):
+        """快速检查文件数量，给用户提示但不阻止查询"""
+        try:
+            file_count = 0
+            max_check = 2000  # 提高检查数量，适应几个月的文件
+
+            for root, dirs, files in os.walk(path):
+                # 限制检查深度
+                depth = root[len(path):].count(os.sep)
+                if depth >= 5:  # 适当增加深度
+                    dirs[:] = []
+                    continue
+
+                for filename in files:
+                    if filename.endswith('.otr'):
+                        file_count += 1
+                        if file_count >= max_check:
+                            break
+
+                if file_count >= max_check:
+                    break
+
+            # 如果发现大量文件，只给出提示，不阻止查询
+            if file_count >= max_check:
+                msg_box = QtWidgets.QMessageBox(self)
+                msg_box.setIcon(QtWidgets.QMessageBox.Information)
+                msg_box.setWindowTitle("大量文件提示")
+                msg_box.setText(f'检测到目录中有大量文件（超过{max_check}个.otr文件）。\n\n'
+                               '程序将开始处理，请耐心等待进度条显示。\n'
+                               '处理过程中请不要关闭程序。')
+                msg_box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+                msg_box.setStyleSheet(self._get_message_box_style())
+                msg_box.exec_()
+
+            return False  # 永远不取消查询，只是提示
+
+        except Exception:
+            return False  # 检查失败时不阻止查询
 
 def is_network_path(path):
     """
