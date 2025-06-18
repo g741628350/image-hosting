@@ -387,13 +387,24 @@ class QueryWorker(QObject):
             return []
             
     def _get_directory_snapshot(self, path, start_timestamp=None, end_timestamp=None):
-        """获取目录快照，修复无限循环问题"""
+        """获取目录快照，针对网络路径优化"""
         files = []
         file_count = 0
         filtered_count = 0
-        max_files = 10000  # 降低文件数限制，避免内存问题
-        progress_interval = 500  # 更频繁的进度更新，让用户知道程序在工作
-        max_scan_count = 100000  # 设置最大扫描文件数，防止无限循环
+
+        # 检测网络路径并调整参数
+        is_network = is_network_path(path)
+        if is_network:
+            max_files = 5000  # 网络路径降低限制
+            progress_interval = 100  # 网络路径更频繁更新
+            max_scan_count = 10000  # 网络路径严格限制扫描数量
+            max_depth = 2  # 网络路径限制深度
+            print(f"检测到网络路径，启用网络优化模式")
+        else:
+            max_files = 10000
+            progress_interval = 500
+            max_scan_count = 100000
+            max_depth = 5
 
         try:
             # 调试信息：打印时间过滤参数
@@ -410,98 +421,173 @@ class QueryWorker(QObject):
 
             self.status_update.emit("正在扫描目录结构...")
 
-            # 使用更安全的目录遍历方式，避免符号链接问题
+            # 使用更安全的目录遍历方式，针对网络路径优化
             visited_dirs = set()  # 记录已访问的目录，避免循环引用
+            processed_files = set()  # 记录已处理的文件，避免重复计数
 
-            for root, dirs, filenames in os.walk(path, followlinks=False):  # 不跟随符号链接
-                if self._check_cancelled():
-                    break
+            # 网络路径使用更保守的遍历策略
+            if is_network:
+                # 网络路径：先尝试直接列出目录，避免深度遍历
+                try:
+                    # 只扫描根目录和一级子目录
+                    for item in os.listdir(path):
+                        if self._check_cancelled():
+                            break
+                        item_path = os.path.join(path, item)
+                        if os.path.isdir(item_path):
+                            # 扫描子目录
+                            try:
+                                for subitem in os.listdir(item_path):
+                                    if subitem.endswith('.otr'):
+                                        file_path = os.path.join(item_path, subitem)
+                                        if file_path not in processed_files:
+                                            processed_files.add(file_path)
+                                            file_count += 1
 
-                # 防止无限循环：检查是否已访问过这个目录
-                real_root = os.path.realpath(root)
-                if real_root in visited_dirs:
-                    continue
-                visited_dirs.add(real_root)
+                                            # 网络路径更频繁的进度更新
+                                            if file_count % progress_interval == 0:
+                                                self.status_update.emit(f"网络扫描: 已发现 {file_count} 个文件...")
+                                                QtWidgets.QApplication.processEvents()
 
-                # 严格限制扫描深度
-                depth = root[len(path):].count(os.sep)
-                if depth >= 5:  # 大幅降低深度限制
-                    dirs[:] = []
-                    continue
+                                            # 应用时间过滤
+                                            if start_timestamp is not None and end_timestamp is not None:
+                                                try:
+                                                    file_stats = os.stat(file_path)
+                                                    file_timestamp = file_stats.st_mtime
+                                                    if start_timestamp <= file_timestamp <= end_timestamp:
+                                                        files.append(file_path)
+                                                        filtered_count += 1
+                                                except (OSError, PermissionError):
+                                                    continue
+                                            else:
+                                                files.append(file_path)
+                                                filtered_count += 1
 
-                # 过滤出.otr文件，减少后续处理
-                otr_files = [f for f in filenames if f.endswith('.otr')]
+                                            # 网络路径严格限制文件数量
+                                            if file_count >= max_scan_count:
+                                                self.status_update.emit(f"网络路径扫描达到限制({max_scan_count})，停止扫描")
+                                                break
+                            except (OSError, PermissionError):
+                                continue
+                        elif item.endswith('.otr'):
+                            # 根目录的.otr文件
+                            file_path = os.path.join(path, item)
+                            if file_path not in processed_files:
+                                processed_files.add(file_path)
+                                file_count += 1
 
-                for filename in otr_files:
+                                # 应用时间过滤
+                                if start_timestamp is not None and end_timestamp is not None:
+                                    try:
+                                        file_stats = os.stat(file_path)
+                                        file_timestamp = file_stats.st_mtime
+                                        if start_timestamp <= file_timestamp <= end_timestamp:
+                                            files.append(file_path)
+                                            filtered_count += 1
+                                    except (OSError, PermissionError):
+                                        continue
+                                else:
+                                    files.append(file_path)
+                                    filtered_count += 1
+                except (OSError, PermissionError) as e:
+                    self.status_update.emit(f"网络路径访问失败: {str(e)}")
+                    return []
+            else:
+                # 本地路径：使用标准的os.walk
+                for root, dirs, filenames in os.walk(path, followlinks=False):  # 不跟随符号链接
                     if self._check_cancelled():
                         break
 
-                    file_count += 1
+                    # 防止无限循环：检查是否已访问过这个目录
+                    real_root = os.path.realpath(root)
+                    if real_root in visited_dirs:
+                        continue
+                    visited_dirs.add(real_root)
 
-                    # 防止无限循环：设置最大扫描数量
-                    if file_count > max_scan_count:
-                        self.status_update.emit(f"扫描文件数量过多({file_count})，停止扫描以避免系统问题")
-                        break
+                    # 根据路径类型限制扫描深度
+                    depth = root[len(path):].count(os.sep)
+                    if depth >= max_depth:
+                        dirs[:] = []
+                        continue
 
-                    # 更频繁的进度更新
-                    if file_count % progress_interval == 0:
-                        if start_timestamp is not None:
-                            self.status_update.emit(f"已扫描 {file_count} 个文件，筛选出 {filtered_count} 个...")
-                        else:
-                            self.status_update.emit(f"已发现 {file_count} 个文件...")
-                        # 强制处理UI事件，保持响应
-                        QtWidgets.QApplication.processEvents()
+                    # 过滤出.otr文件，减少后续处理
+                    otr_files = [f for f in filenames if f.endswith('.otr')]
 
-                    file_path = os.path.join(root, filename)
-
-                    # 如果提供了时间范围，进行时间过滤
-                    if start_timestamp is not None and end_timestamp is not None:
-                        try:
-                            file_stats = os.stat(file_path)
-                            file_timestamp = file_stats.st_mtime
-
-                            # 调试信息：打印前几个文件的时间比较
-                            if filtered_count < 5:  # 增加到前5个符合条件的文件
-                                import datetime
-                                file_dt = datetime.datetime.fromtimestamp(file_timestamp)
-                                start_dt = datetime.datetime.fromtimestamp(start_timestamp)
-                                end_dt = datetime.datetime.fromtimestamp(end_timestamp)
-                                print(f"文件时间检查 #{filtered_count + 1}: {os.path.basename(file_path)}")
-                                print(f"  完整路径: {file_path}")
-                                print(f"  文件时间: {file_timestamp} -> {file_dt}")
-                                print(f"  开始时间: {start_timestamp} -> {start_dt}")
-                                print(f"  结束时间: {end_timestamp} -> {end_dt}")
-                                print(f"  在范围内: {start_timestamp <= file_timestamp <= end_timestamp}")
-                                print(f"  当前目录: {root}")
-                                print("---")
-
-                            # 只有在时间范围内的文件才添加
-                            if start_timestamp <= file_timestamp <= end_timestamp:
-                                files.append(file_path)
-                                filtered_count += 1
-                        except (OSError, PermissionError):
-                            continue
-                    else:
-                        # 没有时间过滤，直接添加
-                        try:
-                            files.append(file_path)
-                            filtered_count += 1
-                        except (OSError, PermissionError):
-                            continue
-
-                    # 如果文件数量达到限制，停止扫描
-                    if len(files) >= max_files:
-                        self.status_update.emit(f"已收集足够文件({len(files)})，停止扫描")
-                        break
-
-                    # 定期检查取消状态
-                    if file_count % 1000 == 0:
+                    for filename in otr_files:
                         if self._check_cancelled():
                             break
 
-                # 如果达到文件数量限制或扫描数量限制，跳出外层循环
-                if len(files) >= max_files or file_count > max_scan_count:
-                    break
+                        file_count += 1
+
+                        # 防止无限循环：设置最大扫描数量
+                        if file_count > max_scan_count:
+                            self.status_update.emit(f"扫描文件数量过多({file_count})，停止扫描以避免系统问题")
+                            break
+
+                        # 更频繁的进度更新
+                        if file_count % progress_interval == 0:
+                            if start_timestamp is not None:
+                                self.status_update.emit(f"已扫描 {file_count} 个文件，筛选出 {filtered_count} 个...")
+                            else:
+                                self.status_update.emit(f"已发现 {file_count} 个文件...")
+                            # 强制处理UI事件，保持响应
+                            QtWidgets.QApplication.processEvents()
+
+                        file_path = os.path.join(root, filename)
+
+                        # 避免重复处理
+                        if file_path in processed_files:
+                            continue
+                        processed_files.add(file_path)
+
+                        # 如果提供了时间范围，进行时间过滤
+                        if start_timestamp is not None and end_timestamp is not None:
+                            try:
+                                file_stats = os.stat(file_path)
+                                file_timestamp = file_stats.st_mtime
+
+                                # 调试信息：打印前几个文件的时间比较
+                                if filtered_count < 5:  # 增加到前5个符合条件的文件
+                                    import datetime
+                                    file_dt = datetime.datetime.fromtimestamp(file_timestamp)
+                                    start_dt = datetime.datetime.fromtimestamp(start_timestamp)
+                                    end_dt = datetime.datetime.fromtimestamp(end_timestamp)
+                                    print(f"文件时间检查 #{filtered_count + 1}: {os.path.basename(file_path)}")
+                                    print(f"  完整路径: {file_path}")
+                                    print(f"  文件时间: {file_timestamp} -> {file_dt}")
+                                    print(f"  开始时间: {start_timestamp} -> {start_dt}")
+                                    print(f"  结束时间: {end_timestamp} -> {end_dt}")
+                                    print(f"  在范围内: {start_timestamp <= file_timestamp <= end_timestamp}")
+                                    print(f"  当前目录: {root}")
+                                    print("---")
+
+                                # 只有在时间范围内的文件才添加
+                                if start_timestamp <= file_timestamp <= end_timestamp:
+                                    files.append(file_path)
+                                    filtered_count += 1
+                            except (OSError, PermissionError):
+                                continue
+                        else:
+                            # 没有时间过滤，直接添加
+                            try:
+                                files.append(file_path)
+                                filtered_count += 1
+                            except (OSError, PermissionError):
+                                continue
+
+                        # 如果文件数量达到限制，停止扫描
+                        if len(files) >= max_files:
+                            self.status_update.emit(f"已收集足够文件({len(files)})，停止扫描")
+                            break
+
+                        # 定期检查取消状态
+                        if file_count % 1000 == 0:
+                            if self._check_cancelled():
+                                break
+
+                    # 如果达到文件数量限制或扫描数量限制，跳出外层循环
+                    if len(files) >= max_files or file_count > max_scan_count:
+                        break
 
             if start_timestamp is not None:
                 print(f"扫描统计:")
