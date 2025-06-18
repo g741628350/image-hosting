@@ -319,7 +319,7 @@ class QueryWorker(QObject):
             status_msg = f"{message} {current}/{total}"
             self.status_update.emit(status_msg)
             
-    def _scan_directory(self, path, start_time, end_time):
+    def _scan_directory(self, path, start_timestamp, end_timestamp):
         """高性能目录扫描函数，针对大量文件优化"""
         try:
             files = []
@@ -380,8 +380,8 @@ class QueryWorker(QObject):
                         futures.append(
                             self._executor.submit(self._check_file_safe,
                                              file_path,
-                                             start_time,
-                                             end_time,
+                                             start_timestamp,
+                                             end_timestamp,
                                              timeout)
                         )
 
@@ -544,16 +544,16 @@ class QueryWorker(QObject):
             print(f"无法列出目录内容 {directory}: {str(e)}")
             return []
 
-    def _check_file_safe(self, file_path, start_time, end_time, timeout=1):
+    def _check_file_safe(self, file_path, start_timestamp, end_timestamp, timeout=1):
         """安全的文件检查，高性能版本"""
         try:
-            # 直接调用检查方法，避免额外的线程池开销
-            return self._check_file_with_retry(file_path, start_time, end_time)
+            # timeout参数保留用于接口兼容性
+            return self._check_file_with_retry(file_path, start_timestamp, end_timestamp)
         except Exception:
             return None
 
-    def _check_file_with_retry(self, file_path, start_time, end_time):
-        """带重试机制的文件检查，高性能版本"""
+    def _check_file_with_retry(self, file_path, start_timestamp, end_timestamp):
+        """带重试机制的文件检查，使用时间戳比较"""
         max_retries = 2  # 减少重试次数
 
         for attempt in range(max_retries):
@@ -569,12 +569,10 @@ class QueryWorker(QObject):
 
                 # 获取文件时间信息
                 file_stats = os.stat(file_path)
-                create_time = file_stats.st_mtime
-                create_time_str = time.strftime('%Y%m%d %H:%M',
-                                              time.localtime(create_time))
+                file_timestamp = file_stats.st_mtime
 
-                # 检查时间范围
-                if start_time <= create_time_str <= end_time:
+                # 使用时间戳比较，更准确可靠
+                if start_timestamp <= file_timestamp <= end_timestamp:
                     return file_path
 
                 return None
@@ -601,9 +599,9 @@ class QueryWorker(QObject):
         except Exception:
             return False
 
-    def _check_file(self, file_path, start_time, end_time):
+    def _check_file(self, file_path, start_timestamp, end_timestamp):
         """检查单个文件是否符合条件（保留原方法用于兼容）"""
-        return self._check_file_safe(file_path, start_time, end_time)
+        return self._check_file_safe(file_path, start_timestamp, end_timestamp)
 
     @timeout(2)  # 文件处理超时控制
     def _process_file(self, file_path):
@@ -630,7 +628,7 @@ class QueryWorker(QObject):
             print(f"处理文件失败 {file_path}: {str(e)}")
             return None
             
-    def do_query(self, path, material_code, start_time, end_time, position=None):
+    def do_query(self, path, material_code, start_timestamp, end_timestamp, position=None):
         """执行查询，针对大量文件优化版本"""
         try:
             # 重置状态
@@ -640,7 +638,7 @@ class QueryWorker(QObject):
             self.status_update.emit("开始查询...")
 
             # 扫描文件
-            files = self._scan_directory(path, start_time, end_time)
+            files = self._scan_directory(path, start_timestamp, end_timestamp)
             if not files:
                 self.error.emit("未找到符合条件的文件")
                 return
@@ -1564,12 +1562,16 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             self._worker.moveToThread(self._worker_thread)
 
             # 连接启动信号并使用正确的时间格式
+            # 将QDateTime转换为时间戳，避免字符串格式问题
+            start_timestamp = start_time.toSecsSinceEpoch()
+            end_timestamp = end_time.toSecsSinceEpoch()
+
             self._worker_thread.started.connect(
                 lambda: self._worker.do_query(
                     folder_path,
                     material_code,
-                    start_time.toString("yyyyMMdd HH:mm"),  # 修改这里:使用固定格式
-                    end_time.toString("yyyyMMdd HH:mm"),    # 修改这里:使用固定格式
+                    start_timestamp,
+                    end_timestamp,
                     position
                 )
             )
