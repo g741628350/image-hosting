@@ -737,7 +737,7 @@ class QueryWorker(QObject):
 class ProgressDialog(QDialog):
     cancelled = pyqtSignal()
 
-    def __init__(self, worker, worker_thread):
+    def __init__(self, worker=None, worker_thread=None):
         super().__init__()
         self.worker = worker
         self.worker_thread = worker_thread
@@ -815,21 +815,23 @@ class ProgressDialog(QDialog):
             }
         """)
         
-        # 连接进度信号
-        self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.status_update.connect(self.update_detail)
+        # 连接进度信号（如果worker存在）
+        if self.worker:
+            self.worker.progress.connect(self.progress_bar.setValue)
+            self.worker.status_update.connect(self.update_detail)
 
     def closeEvent(self, event):
         """只在用户手动关闭窗口且有任务运行时询问"""
-        if not self.program_closing and hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+        if not self.program_closing and self.worker_thread and self.worker_thread.isRunning():
             reply = QMessageBox.question(
-                self, '确认关闭', 
+                self, '确认关闭',
                 '有正在进行的查询任务,确定要关闭吗?',
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
                 # 取消任务并关闭
-                self.worker.cancel()
+                if self.worker:
+                    self.worker.cancel()
                 self.worker_thread.quit()
                 self.worker_thread.wait()
                 event.accept()
@@ -857,6 +859,14 @@ class ProgressDialog(QDialog):
     def update_detail(self, message):
         """更新详细进度信息"""
         self.detail_label.setText(message)
+
+    def connect_worker_signals(self):
+        """连接worker信号"""
+        if self.worker:
+            self.worker.progress.connect(self.progress_bar.setValue)
+            self.worker.status_update.connect(self.update_detail)
+            # 重置进度条为正常模式
+            self.progress_bar.setRange(0, 100)
 
 
 class OTRStatisticsApp(QtWidgets.QWidget):
@@ -1381,15 +1391,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             # 禁用查询按钮
             self.query_button.setEnabled(False)
 
-            # 快速预检查文件数量
-            current_line = self.line_combo.currentText()
-            if current_line and current_line in self.lines_dict:
-                folder_path = self.lines_dict[current_line]
-                if self._quick_file_count_check(folder_path):
-                    # 如果用户选择取消，则退出
-                    self._is_querying = False
-                    self.query_button.setEnabled(True)
-                    return
+            # 移除阻塞的文件数量预检查，直接进入查询流程
             
             # 检查时间范围
             start_time = self.start_time_input.dateTime()
@@ -1507,8 +1509,7 @@ class OTRStatisticsApp(QtWidgets.QWidget):
                 if reply == QtWidgets.QMessageBox.No:
                     return
 
-            # 在后台检查目录是否处于活跃状态
-            self._check_directory_active_async(folder_path)
+            # 移除活跃目录检查，避免UI阻塞
             
             # 检查路径是否存在
             if not os.path.exists(folder_path):
@@ -1531,9 +1532,25 @@ class OTRStatisticsApp(QtWidgets.QWidget):
             material_code = self.material_code_input.text().strip()
             position = self.position_input.text().strip()
 
+            # 立即创建并显示进度对话框，避免任何UI阻塞
+            self._progress_dialog = ProgressDialog(None, None)
+            self._progress_dialog.status_label.setText("正在准备查询...")
+            self._progress_dialog.detail_label.setText("正在初始化，请稍候...")
+            self._progress_dialog.progress_bar.setRange(0, 0)  # 设置为不确定进度
+            self._progress_dialog.show()
+
+            # 强制处理UI事件，确保进度对话框立即显示
+            QtWidgets.QApplication.processEvents()
+
             # 创建新的 worker 和线程
             self._worker = QueryWorker()
             self._worker_thread = QtCore.QThread()
+
+            # 更新进度对话框的worker引用
+            self._progress_dialog.worker = self._worker
+            self._progress_dialog.worker_thread = self._worker_thread
+            self._progress_dialog.cancelled.connect(self.cancel_query)
+            self._progress_dialog.connect_worker_signals()  # 连接worker信号
 
             # 连接信号（使用Qt.UniqueConnection避免重复连接）
             self._worker.finished.connect(self._on_query_finished, QtCore.Qt.UniqueConnection)
@@ -1557,15 +1574,20 @@ class OTRStatisticsApp(QtWidgets.QWidget):
                 )
             )
 
-            # 创建进度对话框
-            self._progress_dialog = ProgressDialog(self._worker, self._worker_thread)
-            self._progress_dialog.cancelled.connect(self.cancel_query)
+            # 更新进度对话框状态并启动查询
+            self._progress_dialog.status_label.setText("正在启动查询...")
+            self._progress_dialog.detail_label.setText("正在启动后台处理线程...")
+            QtWidgets.QApplication.processEvents()
 
             # 启动查询
-            self._progress_dialog.show()
             self._worker_thread.start()
             
         except Exception as e:
+            # 关闭进度对话框
+            if hasattr(self, '_progress_dialog') and self._progress_dialog:
+                self._progress_dialog.close()
+                self._progress_dialog = None
+
             QtWidgets.QMessageBox.critical(self, "错误", f"启动查询时发生错误: {str(e)}")
             # 在异常情况下重置状态
             self._is_querying = False
