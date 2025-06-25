@@ -228,21 +228,9 @@
 参数类型: string（跟随选项）
 描述: 用户选择的输出格式类型
 
-参数名: final_analysis
+参数名: collected_data
 参数类型: string
-描述: 最终的需求分析结果
-
-参数名: final_code
-参数类型: string
-描述: 最终生成的代码
-
-参数名: final_language
-参数类型: string
-描述: 最终确认的编程语言
-
-参数名: final_developer
-参数类型: string
-描述: 最终确认的开发者信息
+描述: 收集的所有数据汇总（包含分析结果、代码、语言、开发者信息）
 ```
 
 ### 节点5：格式化输出（消息响应）
@@ -254,36 +242,20 @@
 #### 配置详情
 ```
 输出参数配置:
-参数名: analysis
+参数名: format_choice
 参数来源: 引用
-参数值: [选择：final_analysis]
+参数值: [选择：output_format]
 
-参数名: code
+参数名: all_data
 参数来源: 引用
-参数值: [选择：final_code]
-
-参数名: language
-参数来源: 引用
-参数值: [选择：user_language]
-
-参数名: developer
-参数来源: 引用
-参数值: [选择：user_name]
+参数值: [选择：collected_data]
 
 回答内容:
 # 🎉 代码生成完成！
 
-## 👨‍💻 开发信息
-**开发者**: {{developer}}
-**编程语言**: {{language}}
+根据您选择的输出格式：**{{format_choice}}**
 
-## 📋 需求分析
-{{analysis}}
-
-## 💻 生成代码
-```{{language}}
-{{code}}
-```
+{{all_data}}
 
 ## 🚀 使用说明
 1. 复制代码到开发环境
