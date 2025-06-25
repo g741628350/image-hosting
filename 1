@@ -212,23 +212,43 @@
 #### 基本配置
 - **节点类型**：变量
 - **节点名称**：技术栈配置
+- **功能说明**：读取预制变量，并可将变量给其他节点进行调用
 
-#### 变量定义
+#### 读取配置
 ```
-变量1:
-- 变量名: selected_framework
-- 变量值: {{tech_stack.framework}}
-- 数据类型: string
+读取变量1:
+变量名: primary_language
+类型: 预置
+说明: 读取Bot中配置的主要编程语言变量
 
-变量2:
-- 变量名: database_type
-- 变量值: {{tech_stack.database}}
-- 数据类型: string
+读取变量2:
+变量名: code_style
+类型: 预置
+说明: 读取Bot中配置的代码风格偏好变量
 
-变量3:
-- 变量名: deployment_target
-- 变量值: {{tech_stack.deployment}}
-- 数据类型: string
+读取变量3:
+变量名: development_mode
+类型: 预置
+说明: 读取Bot中配置的开发模式变量
+
+读取变量4:
+变量名: project_name
+类型: 预置
+说明: 读取Bot中配置的项目名称变量
+
+读取变量5:
+变量名: developer_name
+类型: 预置
+说明: 读取Bot中配置的开发者姓名变量
+```
+
+#### 输出变量
+```
+输出变量1: {{primary_language}} - 可被其他节点引用
+输出变量2: {{code_style}} - 可被其他节点引用
+输出变量3: {{development_mode}} - 可被其他节点引用
+输出变量4: {{project_name}} - 可被其他节点引用
+输出变量5: {{developer_name}} - 可被其他节点引用
 ```
 
 ### 节点4：分类选择器
